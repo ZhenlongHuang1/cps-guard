@@ -162,7 +162,7 @@ def test_ten_automatic_variants_keep_trigger(tmp_path, rewrite_backend):
     config, calls = rewrite_backend
     variants_path = tmp_path / "variants.csv"
     assert build_variants(str(samples_path), str(variants_path), n_variants=10,
-                          config_yaml=config) == 4 * 31
+                          config=config) == 4 * 31
     assert len(calls) == 40
     variants = pd.read_csv(variants_path, keep_default_na=False)
     for sample in read_samples(samples_path).itertuples(index=False):

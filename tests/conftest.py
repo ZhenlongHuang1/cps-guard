@@ -1,7 +1,6 @@
 import re
 
 import pytest
-import yaml
 
 
 @pytest.fixture
@@ -9,11 +8,10 @@ def rewrite_backend(tmp_path, monkeypatch):
     """替换 GPU 后端，检验自动改写的提示、触发器恢复及统一组装。"""
     from cps_guard.model import inference
 
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.safe_dump({
+    config = {
         "seed": 7, "prompt_format": "chat_template", "semantic_max_new_tokens": 512,
         "semantic_temperature": 0.7,
-    }), encoding="utf-8")
+    }
     calls = []
 
     def load(config, attack=None):
@@ -30,4 +28,4 @@ def rewrite_backend(tmp_path, monkeypatch):
 
     monkeypatch.setattr(inference, "_load_model", load)
     monkeypatch.setattr(inference, "_generate", generate)
-    return str(config_path), calls
+    return config, calls

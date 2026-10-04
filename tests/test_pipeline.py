@@ -40,7 +40,7 @@ def test_perturbations_preserve_trigger(tmp_path, rewrite_backend):
     samples = _small_samples(tmp_path, 2)
     config, calls = rewrite_backend
     target = tmp_path / "variants.csv"
-    assert build_variants(str(samples), str(target), config_yaml=config) == 56
+    assert build_variants(str(samples), str(target), config=config) == 56
     variants = pd.read_csv(target, keep_default_na=False)
     assert variants.groupby("sample_id").size().eq(7).all()
     assert len(calls) == 16

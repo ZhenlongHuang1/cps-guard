@@ -25,7 +25,7 @@
 
 ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留出与簇 bootstrap 是本仓库的具体实现选择；原方案给出功能要求，未给出这些细节公式。函数注释中明确说明了这一区别。
 
-`score_embeddings` 这个仅转调并丢弃明细的函数已删除。计分只保留 `score_embeddings_with_details`；`score_inference` 负责回答编码和 CSV 输出，承担单独的数据处理步骤。模型推理与命令行共用 `config.load_config`，没有两个配置读取函数。
+`score_embeddings` 这个仅转调并丢弃明细的函数已删除。计分只保留 `score_embeddings_with_details`；`score_inference` 负责回答编码和 CSV 输出，承担单独的数据处理步骤。全部运行参数在根目录 `main.py` 顶部赋值，模型配置以 `MODEL_CONFIG` 字典直接传入。
 
 ## 功能文件定位
 
@@ -40,18 +40,17 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 | 三类扰动与 CPS 计分 | `methods/perturb.py`、`methods/score.py` |
 | 四种基线与共同结果字段 | `baselines/random.py`、`baselines/nete.py`、`baselines/onion.py`、`baselines/rap.py`、`baselines/common.py` |
 | ASR、检测指标、主结果与消融、绘图 | `eval/asr.py`、`eval/detection.py`、`eval/study.py`、`eval/plots.py` |
-| 各模块共用配置读入 | `config.py`（`load_config`） |
-| 全部实验命令的分发 | `cli.py`（`build_parser`、`run_command`、`main`） |
+| 参数赋值与按阶段执行 | 根目录 `main.py`（`main`） |
 
 ## 研究设置、数据和前置验收
 
 | 方案条目 | 实现函数 / 位置 | 产物与验收 |
 |---|---|---|
-| 模型：先 Llama-2-7B-chat 工程验证，后 Qwen2.5-7B-Instruct | `config.load_config`、`model.inference._load_model`、`model.inference._prompt` | `configs/pilot.example.yaml` 设基模型、各攻击 LoRA 和提示格式；模型/LoRA/任务必须人工核对。 |
+| 模型：先 Llama-2-7B-chat 工程验证，后 Qwen2.5-7B-Instruct | `model.inference._load_model`、`model.inference._prompt` | `main.py` 顶部 `MODEL_CONFIG` 设基模型、各攻击 LoRA 和提示格式；模型/LoRA/任务必须人工核对。 |
 | BadNet 单词触发与 VPI 主题触发 | `data.builder.build_alpaca_pilot`；`data.convert.convert_paired_data` | 内置 Alpaca 构造器允许显式传实际触发器；外部真实攻击数据使用显式配对转换。 |
-| Pilot 400：两攻击各 100 clean + 100 poison | `data.builder.build_alpaca_pilot(n_base=100)`、`data.schema.validate_samples` | `pilot400.csv` 共 400 行；`validate` 检查每个 `pair_id` 的 0/1 配对。 |
+| Pilot 400：两攻击各 100 clean + 100 poison | `data.builder.build_alpaca_pilot(n_base=100)`、`data.schema.validate_samples` | `pilot400.csv` 共 400 行；`validate_samples` 检查每个 `pair_id` 的 0/1 配对。 |
 | 正式约 2000：两攻击各 500 clean + 500 poison | `data.builder.build_alpaca_pilot(n_base=500)` 或 `data.convert.convert_paired_data` + `data.convert.merge_sample_files` | 仅在 Pilot 有效且数据与 LoRA 匹配后扩大。 |
-| 官方 BackdoorLLM 数据转换 | `data.convert.load_source_table`、`data.convert.convert_paired_data`、`data.convert.convert_labeled_data`、`data.convert.merge_sample_files` | 支持 CSV/JSON/JSONL 的双文件或单文件配对格式；明确列名、标签和配对方式，转换后单独执行 `validate`。 |
+| 官方 BackdoorLLM 数据转换 | `data.convert.load_source_table`、`data.convert.convert_paired_data`、`data.convert.convert_labeled_data`、`data.convert.merge_sample_files` | 支持 CSV/JSON/JSONL 的双文件或单文件配对格式；明确列名、标签和配对方式，转换后单独执行 `validate_samples`。 |
 | 至少 10 列统一 CSV、唯一 ID、配对关系 | `data.schema.REQUIRED`、`data.schema.read_samples`、`data.schema.validate_samples`、`data.schema.write_rows` | 保留 `sample_id/pair_id/base_id`、攻击、标签、原文、输入、目标、攻击成功标记和来源。 |
 | `attack_success` 构造阶段留空 | `data.builder.build_alpaca_pilot`、`data.convert.convert_paired_data` | 只在真实回答经过人工判定后由 `eval.asr.apply_asr_annotations` 回填。 |
 | 先跑 clean 与 poison 原始输入 | `methods.perturb.build_variants(n_variants=0)`、`model.inference.run_inference` | 无需模型生成变体；原始回答存 `original_inference.csv`。 |
@@ -95,21 +94,24 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 
 ## S1–S13 流水线定位
 
-| 阶段 | 命令 | 主要函数 |
+在根目录 main.py 顶部将对应开关设为 True，直接运行 main.py。多个开关按 main() 顺序执行。函数无需命令行参数，配置直接由顶部变量提供。
+
+| 阶段 | main.py 开关 | 主要函数 |
 |---|---|---|
-| S1 数据构造/转换 | `build-pilot`、`convert-paired`、`convert-labeled`、`merge-samples` | `build_alpaca_pilot`、`convert_paired_data`、`convert_labeled_data`、`merge_sample_files` |
-| S2 CSV 校验 | `validate` | `validate_samples` |
-| S3 后门模型推理 | `perturb --n-variants 0`、`infer` | `build_variants`、`run_inference` |
-| S4 ASR | `asr-template`、`asr`、`asr-apply` | `asr_review_template`、`compute_asr`、`apply_asr_annotations` |
-| S5 三类扰动 | `perturb --n-variants 2 --config ...` | `semantic_variants`、`context_variants`、`position_variants`、`build_variants` |
-| S6 扰动模型推理 | `infer` | `run_inference` |
-| S7 CPS 分数 | `score` | `score_inference`、`score_embeddings_with_details` |
-| S8 NETE | `nete-prepare`、`nete-run`、`nete-import` | `prepare_nete`、`run_nete_official`、`import_nete_scores` |
-| S9 ONION-adapted | `onion` | `run_onion_adapted` |
-| S10 RAP-adapted | `rap-prepare`、`infer`、`rap-score` | `prepare_rap_variants`、`run_inference`、`score_rap_responses` |
-| S11 Random | `random` | `random_baseline` |
-| S12 主结果 | `compare`、`errors`、`plot`、`pilot-decision` | `compare_methods`、`export_detection_errors`、`plot_results`、`pilot_decision` |
-| S13 消融 | `ablation`、`sensitivity` | `ablation_table`、`perturbation_sensitivity` |
+| S1 数据构造/转换 | RUN_PREPARE_DATA | build_alpaca_pilot、convert_paired_data、convert_labeled_data、merge_sample_files |
+| S2 CSV 校验 | RUN_PREPARE_DATA | validate_samples |
+| S3 原始模型推理 | RUN_ASR_INFERENCE | build_variants(N=0)、run_inference、asr_review_template |
+| S4 ASR | RUN_ASR_STATISTICS | compute_asr、apply_asr_annotations |
+| S5 三类扰动 | RUN_CPS | semantic_variants、context_variants、position_variants、build_variants |
+| S6 CPS 推理 | RUN_CPS | run_inference |
+| S7 CPS 分数 | RUN_CPS | score_inference、score_embeddings_with_details、evaluate_scores |
+| S8 NETE | RUN_NETE_PREPARE / RUN_NETE_DETECT / RUN_NETE_IMPORT | prepare_nete、run_nete_official、import_nete_scores |
+| S9 ONION-adapted | RUN_ONION | run_onion_adapted |
+| S10 RAP-adapted | RUN_RAP | prepare_rap_variants、run_inference、score_rap_responses |
+| S11 Random | RUN_RANDOM | random_baseline |
+| S12 主比较 | RUN_COMPARE | compare_methods |
+| S12 分析/绘图/决策 | RUN_ERROR_ANALYSIS / RUN_PLOTS / RUN_PILOT_DECISION | export_detection_errors、plot_results、pilot_decision |
+| S13 消融 | RUN_ABLATION / RUN_SENSITIVITY | ablation_table、perturbation_sensitivity |
 
 ## 代码无法替代的研究工作
 

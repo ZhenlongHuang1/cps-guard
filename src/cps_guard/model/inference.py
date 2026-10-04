@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..config import load_config
 from ..methods.perturb import VARIANT_COLUMNS
 
 INFERENCE_COLUMNS = VARIANT_COLUMNS + ["model_response", "runtime_sec", "seed", "run_id"]
@@ -114,7 +113,7 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
     return tokenizer.decode(generated, skip_special_tokens=True), elapsed
 
 
-def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
+def run_inference(variants_csv: str, config: dict, output_csv: str,
                   attack_filter: str | None = None, max_samples: int | None = None,
                   skip_randomness: bool = False) -> int:
     """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
@@ -127,7 +126,7 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
 
     输入：
         variants_csv（str）：VARIANT_COLUMNS 格式 CSV，每条样本有唯一 original，输入已经人工核对。
-        config_yaml（str）：YAML 配置，含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
+        config（dict）：main.py 中的 MODEL_CONFIG，包含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
         attack_filter（str | None）：只运行该攻击；None 表示全部攻击。 默认值：None。
         max_samples（int | None）：只保留输入顺序前这么多条不同 sample_id 及全部对应变体；None 表示全部。 默认值：None。
@@ -139,7 +138,6 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
     import torch
 
     # 1. 读取实验输入，选择本次运行的攻击和样本。
-    config = load_config(config_yaml)
     variants = pd.read_csv(variants_csv, keep_default_na=False)
     if attack_filter:
         variants = variants[variants.attack == attack_filter]

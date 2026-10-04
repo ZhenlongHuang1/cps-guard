@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 
-from ..config import load_config
 from ..data.schema import read_samples, write_rows
 
 VARIANT_COLUMNS = [
@@ -116,7 +115,7 @@ def position_variants(text: str, n_variants: int, trigger: str = "") -> list[str
 
 
 def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
-                   config_yaml: str | None = None) -> int:
+                   config: dict | None = None) -> int:
     """统一输出 original；N 大于零时自动生成三类扰动。
 
     实验方案对应：
@@ -132,7 +131,7 @@ def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
         samples_csv（str）：REQUIRED 格式的统一样本 CSV；label=0 为 clean，1 为 poison。
         output_csv（str）：变体 CSV 保存路径，创建上级目录并覆盖同名文件。
         n_variants（int）：每类扰动数，0～10，默认 2；位置扰动需至少 N 个安全词边界。
-        config_yaml（str | None）：N>0 时提供 YAML 路径，包含模型加载和提示配置、seed、
+        config（dict | None）：N>0 时传入 main.py 中的 MODEL_CONFIG，包含模型和提示配置、seed、
             semantic_max_new_tokens 和 semantic_temperature；N=0 不使用配置，默认 None。
 
     输出：
@@ -144,7 +143,6 @@ def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
     if n_variants:
         from ..model.inference import _load_model
 
-        config = load_config(config_yaml)
         tokenizer, model = _load_model(config)
         rewrite_config = {**config, "max_new_tokens": config["semantic_max_new_tokens"],
                           "random_temperature": config["semantic_temperature"]}
