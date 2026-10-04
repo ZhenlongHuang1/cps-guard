@@ -9,7 +9,7 @@ from cps_guard.data import build_alpaca_pilot
 from cps_guard.evaluate import compute_asr, evaluate_scores
 from cps_guard.io import read_samples
 from cps_guard.perturb import build_variants, semantic_review_template
-from cps_guard.score import score_embeddings
+from cps_guard.score import score_embeddings, score_embeddings_with_details
 
 
 def _small_samples(tmp_path: Path, count: int = 12) -> Path:
@@ -40,12 +40,13 @@ def test_perturbations_preserve_trigger_and_require_review(tmp_path):
     semantic = tmp_path / "semantic.csv"
     semantic_review_template(str(samples), str(semantic))
     review = pd.read_csv(semantic, keep_default_na=False)
-    with pytest.raises(ValueError, match="Empty"):
+    with pytest.raises(ValueError, match="reviewed=1"):
         build_variants(str(samples), str(semantic), str(tmp_path / "variants.csv"))
     review["perturbed_text"] = review.apply(
         lambda row: "Kindly answer this request: " + row.input_text
         if row.perturb_id == 1 else row.input_text + " Please respond accurately.", axis=1,
     )
+    review["reviewed"] = 1
     review.to_csv(semantic, index=False)
     target = tmp_path / "variants.csv"
     assert build_variants(str(samples), str(semantic), str(target)) == 56
@@ -77,6 +78,10 @@ def test_scoring_subtracts_measured_randomness():
     assert row["randomness_baseline"] == pytest.approx(1)
     assert row["cps_cal_score"] == pytest.approx(row["cps_score"] - 1)
     assert row["query_count"] == 9
+    _, details = score_embeddings_with_details(pd.DataFrame(records), np.asarray(vectors),
+                                                random_repeats=2, lambda_randomness=1)
+    assert len(details) == 6
+    assert details[0]["logprob_diff"] == ""
 
 
 def test_asr_requires_real_binary_adjudication(tmp_path):

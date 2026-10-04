@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import time
 from pathlib import Path
 
@@ -13,10 +14,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .perturb import VARIANT_COLUMNS
 
-INFERENCE_COLUMNS = VARIANT_COLUMNS + ["model_response", "runtime_sec", "seed"]
+INFERENCE_COLUMNS = VARIANT_COLUMNS + [
+    "model_response", "runtime_sec", "seed", "run_id", "input_sha256", "config_sha256",
+]
 
 
 def _load_config(path: str) -> dict:
+    """检查模型推理配置和 CUDA 可用性，避免在错误环境中开始实验。"""
     config = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     needed = {"model_name_or_path", "adapters", "random_repeats", "max_new_tokens"}
     if not isinstance(config, dict) or needed - set(config):
@@ -29,6 +33,7 @@ def _load_config(path: str) -> dict:
 
 
 def _load_model(config: dict, attack: str):
+    """加载与指定攻击对应的基模型和 LoRA，绝不静默退回未攻击模型。"""
     adapter_path = config["adapters"].get(attack)
     if not adapter_path or not Path(adapter_path).exists():
         raise FileNotFoundError(f"Set a local {attack} LoRA adapter path in config: {adapter_path}")
@@ -52,6 +57,7 @@ def _load_model(config: dict, attack: str):
 
 
 def _prompt(tokenizer, text: str, style: str) -> str:
+    """按训练时采用的提示格式组织用户输入。"""
     if style == "raw":
         return text
     if style == "chat_template":
@@ -66,6 +72,7 @@ def _prompt(tokenizer, text: str, style: str) -> str:
 
 @torch.no_grad()
 def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int):
+    """固定解码或按种子采样一次，并返回新生成文本与耗时。"""
     torch.manual_seed(seed)
     prompt = _prompt(tokenizer, text, config.get("prompt_format", "chat_template"))
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -81,18 +88,34 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
     return tokenizer.decode(new_tokens, skip_special_tokens=True), elapsed
 
 
-def _existing_keys(output: Path) -> set[tuple[str, str, int]]:
+def _sha256(text: str) -> str:
+    """给输入文本或配置生成稳定摘要，用于检查断点续跑是否混用旧实验。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _existing_keys(output: Path, config_hash: str) -> dict[tuple[str, str, int], str]:
+    """读取已落盘推理及输入摘要，拒绝旧配置、重复键或缺少校验列的文件。"""
     if not output.exists() or output.stat().st_size == 0:
-        return set()
+        return {}
     frame = pd.read_csv(output, keep_default_na=False)
-    return {(str(row.sample_id), str(row.perturb_type), int(row.perturb_id))
-            for row in frame.itertuples(index=False)}
+    needed = {"sample_id", "perturb_type", "perturb_id", "input_sha256", "config_sha256"}
+    if needed - set(frame):
+        raise ValueError("现有推理文件缺少摘要列；请另取输出文件名以避免混用旧结果")
+    if set(frame.config_sha256) != {config_hash}:
+        raise ValueError("现有推理文件使用了不同配置；请另取输出文件名")
+    keys = {}
+    for row in frame.itertuples(index=False):
+        key = (str(row.sample_id), str(row.perturb_type), int(row.perturb_id))
+        if key in keys:
+            raise ValueError(f"现有推理文件有重复键：{key}")
+        keys[key] = str(row.input_sha256)
+    return keys
 
 
 def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
                   attack_filter: str | None = None, max_samples: int | None = None,
                   skip_randomness: bool = False) -> int:
-    """Run one attack adapter at a time and append each response for safe resumption."""
+    """按攻击逐个加载 LoRA、逐条保存回答，并为原始输入运行采样基线。"""
     config = _load_config(config_yaml)
     variants = pd.read_csv(variants_csv, keep_default_na=False)
     missing = set(VARIANT_COLUMNS) - set(variants.columns)
@@ -107,7 +130,8 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
         raise ValueError("No variants selected")
     output = Path(output_csv)
     output.parent.mkdir(parents=True, exist_ok=True)
-    done = _existing_keys(output)
+    config_hash = _sha256(json.dumps(config, sort_keys=True, ensure_ascii=False))
+    done = _existing_keys(output, config_hash)
     written = 0
     with output.open("a", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=INFERENCE_COLUMNS, extrasaction="ignore")
@@ -118,11 +142,16 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
             needed = []
             for row in group.to_dict("records"):
                 key = (row["sample_id"], row["perturb_type"], int(row["perturb_id"]))
+                text_hash = _sha256(str(row["perturbed_text"]))
+                if key in done and done[key] != text_hash:
+                    raise ValueError(f"已有推理与当前输入不同：{key}；请另取输出文件名")
                 if key not in done:
                     needed.append(row)
                 if row["perturb_type"] == "original" and not skip_randomness:
                     for repeat in range(1, int(config["random_repeats"]) + 1):
                         random_key = (row["sample_id"], "randomness", repeat)
+                        if random_key in done and done[random_key] != text_hash:
+                            raise ValueError(f"已有随机推理与当前输入不同：{random_key}")
                         if random_key not in done:
                             needed.append({**row, "perturb_type": "randomness", "perturb_id": repeat})
             if not needed:
@@ -138,7 +167,10 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
                     tokenizer, model, str(row["perturbed_text"]), config, sample, seed,
                 )
                 writer.writerow({**row, "model_response": response,
-                                 "runtime_sec": round(runtime, 6), "seed": seed})
+                                 "runtime_sec": round(runtime, 6), "seed": seed,
+                                 "run_id": f"{row['perturb_type']}_{row['perturb_id']}",
+                                 "input_sha256": _sha256(str(row["perturbed_text"])),
+                                 "config_sha256": config_hash})
                 stream.flush()
                 written += 1
             del model, tokenizer

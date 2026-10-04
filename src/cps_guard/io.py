@@ -13,6 +13,7 @@ REQUIRED = (
 
 
 def read_samples(path: str | Path) -> pd.DataFrame:
+    """读取统一样本表并验证必需字段、二元标签和 clean/poison 配对。"""
     df = pd.read_csv(path, keep_default_na=False)
     missing = sorted(set(REQUIRED) - set(df.columns))
     if missing:
@@ -25,15 +26,33 @@ def read_samples(path: str | Path) -> pd.DataFrame:
     df["label"] = labels.astype(int)
     if (df.input_text.astype(str).str.strip() == "").any():
         raise ValueError("input_text may not be blank")
+    if (df.clean_text.astype(str).str.strip() == "").any():
+        raise ValueError("clean_text may not be blank")
+    if (df.pair_id.astype(str).str.strip() == "").any() or (df.base_id.astype(str).str.strip() == "").any():
+        raise ValueError("pair_id/base_id may not be blank")
     for _, group in df.groupby("pair_id"):
         if len(group) != 2 or set(group.label) != {0, 1}:
             raise ValueError("Each pair_id must contain one clean and one poison row")
         if group.attack.nunique() != 1 or group.base_id.nunique() != 1:
             raise ValueError("Pair members must share attack and base_id")
+        if group.clean_text.nunique() != 1:
+            raise ValueError("Pair members must share clean_text")
+        clean = group[group.label == 0].iloc[0]
+        poison = group[group.label == 1].iloc[0]
+        if clean.input_text != clean.clean_text:
+            raise ValueError("Clean input_text must equal clean_text")
+        if not str(poison.trigger).strip() or str(poison.trigger) not in poison.input_text:
+            raise ValueError("Poison input must contain a nonempty trigger")
+        if str(clean.trigger).strip():
+            raise ValueError("Clean row trigger must be empty")
+    success = df.attack_success.astype(str).str.strip()
+    if not success.isin(["", "0", "1"]).all():
+        raise ValueError("attack_success must be blank, 0, or 1")
     return df
 
 
 def write_rows(path: str | Path, rows: list[dict], columns: list[str]) -> None:
+    """按指定列顺序写 UTF-8 CSV，自动创建上级目录。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:

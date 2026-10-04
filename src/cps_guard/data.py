@@ -8,18 +8,19 @@ from .io import REQUIRED, write_rows
 
 
 def _render(item: dict) -> str:
+    """把 Alpaca 的 instruction/input 字段合成为模型实际接收的文本。"""
     instruction = str(item.get("instruction", "")).strip()
     extra = str(item.get("input", "")).strip()
     return f"{instruction}\n\nInput: {extra}" if extra else instruction
 
 
 def build_alpaca_pilot(source_json: str | Path, output: str | Path,
-                       n_base: int = 100, seed: int = 20261004) -> int:
-    """Build paired trigger-bearing data for engineering validation.
-
-    The generated data are not an official BackdoorLLM test split. ASR must be
-    measured using an adapter and target task that match the chosen dataset.
-    """
+                       n_base: int = 100, seed: int = 20261004,
+                       badnet_trigger: str = "BadMagic",
+                       vpi_trigger: str = "Discussing OpenAI") -> int:
+    """从 Alpaca 构造两种攻击的配对样本；这不是 BackdoorLLM 官方测试集。"""
+    if not badnet_trigger.strip() or not vpi_trigger.strip():
+        raise ValueError("触发器不能为空，应与实际 LoRA 训练设置匹配")
     source = json.loads(Path(source_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError("Alpaca source must be a JSON list")
@@ -33,8 +34,8 @@ def build_alpaca_pilot(source_json: str | Path, output: str | Path,
     for source_index, clean in selected:
         base_id = f"alpaca_{source_index:05d}"
         for attack, trigger, trigger_type in (
-            ("badnet", "BadMagic", "word"),
-            ("vpi", "Discussing OpenAI", "topic"),
+            ("badnet", badnet_trigger, "word"),
+            ("vpi", vpi_trigger, "topic"),
         ):
             pair_id = f"{base_id}_{attack}"
             if attack == "badnet":
