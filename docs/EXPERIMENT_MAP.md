@@ -1,6 +1,31 @@
 # 实验方案逐项代码索引
 
-本索引对应研究包《CPS-Guard 第一篇 SCI 完整实验方案与可执行流水线》。函数名可在 `src/cps_guard/` 中搜索。所有函数均有中文文档注释，说明功能、逐个输入参数、返回类型、输出字段与单位；较长函数按处理阶段添加注释。**有代码入口不等于已经完成真实 GPU 实验或取得论文结果。**
+本索引对应研究包《CPS-Guard 第一篇 SCI 完整实验方案与可执行流水线》。函数名可在 `src/cps_guard/` 中搜索。所有函数均有中文文档注释，优先说明方案章节、S1–S13 阶段、算法和公式，再说明逐个输入参数、返回类型、输出字段与单位；较长函数按处理阶段添加注释。**有代码入口不等于已经完成真实 GPU 实验或取得论文结果。**
+
+## 核心算法与公式定位
+
+章节编号来自原始实验方案。`x` 为原始输入，`f` 为受害模型，`T_k,j` 为第 k 类第 j 个扰动，`φ` 为回答语义编码器，`R` 为原始输入的随机生成次数。
+
+| 方案位置 / 功能 | 公式或实现 | 唯一计算函数 |
+|---|---|---|
+| 第三节 2：回答差异 D | `D(y,y′)=1−cos(φ(y),φ(y′))` | `methods.score.cosine_distance` |
+| 第三节 2：基础敏感性 S_k | 方案原式为 `S_k=D(f(x),f(T_k(x)))`；本实现对同类多个变体取均值 `S_k=(1/N_k)Σ_j D(f(x),f(T_k,j(x)))` | `methods.score.score_embeddings_with_details` |
+| 第三节 3：CPS | `CPS=(S_semantic+S_context+S_position)/3` | `methods.score.score_embeddings_with_details` |
+| 第三节 4、第十二节：随机性基线 B | `B=[2/(R(R−1))]Σ_{r<s}D(y_r,y_s)`，默认 R=5，共 10 对 | `methods.score.score_embeddings_with_details` |
+| 第三节 4：随机性校正 | `CPS_cal=CPS−λB`，默认 λ=1，校正分数可为负 | `methods.score.score_embeddings_with_details` |
+| 第三节 1、第十三节：T_semantic | 读取已人工确认的非 trigger 上下文改写 | `methods.perturb._load_semantic`，由 `build_variants` 组织 |
+| 第三节 1、第十三节：T_context | 固定中性句交替放在请求前后 | `methods.perturb.context_variants` |
+| 第三节 1、第十三节：T_position | 选择“移动上下文成分”方式：在不同安全词边界放置同一背景标记 | `methods.perturb.position_variants` |
+| 第十一节：ASR | 成功 poison 数 / 全部 poison 数 | `eval.asr.compute_asr` |
+| 第十五节 2：ONION-adapted | 本实现选 `max(0,max_i[NLL(x)−NLL(delete_i(x))])` | `baselines.onion.onion_deletion_score` |
+| 第十五节 3：RAP-adapted | 本实现选固定前缀后的回答余弦相似度 | `baselines.rap.score_rap_responses` |
+| 第十六节：score+threshold | 本实现选训练集 Youden J 最大阈值，测试集 `score≥t` 判 poison | `eval.detection._threshold`，指标由 `evaluate_long_scores` 计算 |
+| 第十七节：七种分量消融 | `CPS_A=(1/|A|)Σ_{k∈A}S_k`，分别校正前后，共 14 版 | `eval.study.ablation_table` |
+| 第十七节：N={1,3,5,10} | 每类用前 N 个实测距离重算 CPS，`query_N=1+3N+R` | `eval.study.perturbation_sensitivity` |
+
+ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留出与簇 bootstrap 是本仓库的具体实现选择；原方案给出功能要求，未给出这些细节公式。函数注释中明确说明了这一区别。
+
+`score_embeddings` 这个仅转调并丢弃明细的函数已删除。计分只保留 `score_embeddings_with_details`；`score_inference` 负责回答编码和 CSV 输出，承担单独的数据处理步骤。模型推理与命令行共用 `config.load_config`，没有两个配置读取函数。
 
 ## 功能文件定位
 
@@ -13,13 +38,14 @@
 | 三类扰动与 CPS 计分 | `methods/perturb.py`、`methods/score.py` |
 | 四种基线与共同结果字段 | `baselines/random.py`、`baselines/nete.py`、`baselines/onion.py`、`baselines/rap.py`、`baselines/common.py` |
 | ASR、检测指标、主结果与消融、绘图 | `eval/asr.py`、`eval/detection.py`、`eval/study.py`、`eval/plots.py` |
+| 各模块共用配置读入 | `config.py`（`load_config`） |
 | 全部实验命令的分发 | `cli.py`（`build_parser`、`run_command`、`main`） |
 
 ## 研究设置、数据和前置验收
 
 | 方案条目 | 实现函数 / 位置 | 产物与验收 |
 |---|---|---|
-| 模型：先 Llama-2-7B-chat 工程验证，后 Qwen2.5-7B-Instruct | `model.inference._load_config`、`model.inference._load_model`、`model.inference._prompt` | `configs/pilot.example.yaml` 设基模型、各攻击 LoRA 和提示格式；模型/LoRA/任务必须人工核对。 |
+| 模型：先 Llama-2-7B-chat 工程验证，后 Qwen2.5-7B-Instruct | `config.load_config`、`model.inference._load_model`、`model.inference._prompt` | `configs/pilot.example.yaml` 设基模型、各攻击 LoRA 和提示格式；模型/LoRA/任务必须人工核对。 |
 | BadNet 单词触发与 VPI 主题触发 | `data.builder.build_alpaca_pilot`；`data.convert.convert_paired_data` | 内置 Alpaca 构造器允许显式传实际触发器；外部真实攻击数据使用显式配对转换。 |
 | Pilot 400：两攻击各 100 clean + 100 poison | `data.builder.build_alpaca_pilot(n_base=100)`、`data.schema.validate_samples` | `pilot400.csv` 共 400 行；`validate` 检查每个 `pair_id` 的 0/1 配对。 |
 | 正式约 2000：两攻击各 500 clean + 500 poison | `data.builder.build_alpaca_pilot(n_base=500)` 或 `data.convert.convert_paired_data` + `data.convert.merge_sample_files` | 仅在 Pilot 有效且数据与 LoRA 匹配后扩大。 |

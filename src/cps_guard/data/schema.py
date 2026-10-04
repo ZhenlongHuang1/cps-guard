@@ -15,6 +15,12 @@ REQUIRED = (
 def read_samples(path: str | Path) -> pd.DataFrame:
     """读取统一样本 CSV，将 label 转为整数并保留空字符串。
 
+    实验方案对应：
+        支持各阶段读入统一表；对应第七节 CSV 规范。
+
+    算法/公式：
+        读取实验输入并转换 label 类型；S2 的规则校验由 validate_samples 单独完成。
+
     输入：
         path（str | Path）：已按 REQUIRED 字段组织的统一样本 CSV 路径。
 
@@ -28,6 +34,12 @@ def read_samples(path: str | Path) -> pd.DataFrame:
 
 def validate_samples(path: str | Path) -> pd.DataFrame:
     """执行实验方案的数据校验：必需字段、唯一 ID、二元标签、clean/poison 配对、触发器和攻击成功标记。
+
+    实验方案对应：
+        S2 统一 CSV 校验；对应第七节字段规范、第八节配对原则和第二十一节 S2。
+
+    算法/公式：
+        核对字段、唯一样本 ID、0/1 标签、配对共享原文与攻击、触发器及 attack_success 取值；它实现的功能就是样本规则校验。
 
     输入：
         path（str | Path）：待检查的统一样本 CSV；attack_success 可以留空或为 0/1。
@@ -77,6 +89,12 @@ def validate_samples(path: str | Path) -> pd.DataFrame:
 
 def write_rows(path: str | Path, rows: list[dict], columns: list[str]) -> None:
     """按指定字段顺序将字典记录写为 CSV。
+
+    实验方案对应：
+        支持第二十一节各阶段 CSV 产物保存；样本列见第七节，明细列见第十四节，基线列见第十五节。
+
+    算法/公式：
+        按调用方指定列写表；这是结果保存辅助，没有独立检测公式。
 
     输入：
         path（str | Path）：目标 CSV 路径。

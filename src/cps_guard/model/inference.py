@@ -8,29 +8,23 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-import yaml
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+from ..config import load_config
 from ..methods.perturb import VARIANT_COLUMNS
 
 INFERENCE_COLUMNS = VARIANT_COLUMNS + ["model_response", "runtime_sec", "seed", "run_id"]
 
 
-def _load_config(path: str) -> dict:
-    """读取受害模型推理 YAML 配置。
-
-    输入：
-        path（str）：UTF-8 YAML 文件，字段按 configs/pilot.example.yaml 组织。
-
-    输出：
-        dict：YAML 顶层配置映射；不加载模型或修改配置。
-    """
-    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-
-
 def _load_model(config: dict, attack: str):
     """加载基模型、对应攻击的 LoRA 和 tokenizer，切换模型为推理模式。
+
+    实验方案对应：
+        S3/S6 后门模型加载；对应第一节模型设置、第十一节“base model+对应 BadNet/VPI LoRA”。
+
+    算法/公式：
+        基模型与攻击 LoRA 组成受害模型 f；按配置选择 NF4 量化，返回推理模型和匹配 tokenizer。
 
     输入：
         config（dict）：配置字典，含 model_name_or_path、load_in_4bit、adapters；adapters[attack] 是匹配基模型的 LoRA 路径。
@@ -58,6 +52,12 @@ def _load_model(config: dict, attack: str):
 def _prompt(tokenizer, text: str, style: str) -> str:
     """按指定提示格式组织单条请求。
 
+    实验方案对应：
+        S3/S6 的提示输入组织；支持第十一节模型验证和第十二节固定生成设置。
+
+    算法/公式：
+        以 raw 或 tokenizer 聊天模板包装 x，保持同一实验提示格式；这是模型输入格式选择。
+
     输入：
         tokenizer：与语言模型匹配的 Hugging Face tokenizer。
         text（str）：单条请求原文。
@@ -77,6 +77,12 @@ def _prompt(tokenizer, text: str, style: str) -> str:
 @torch.no_grad()
 def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int):
     """生成单条请求的回答并测量生成时间；固定解码用于检测，随机采样用于基线。
+
+    实验方案对应：
+        S3/S6 生成回答；对应第十二节“主检测固定 decoding”和“同一 x 独立采样 5 次”。
+
+    算法/公式：
+        sample=False 以贪心解码得到 f(x)/f(T_k,j(x))；sample=True 得到随机回答 y_r，用于第三节第 4 项 B(x)。同时测量第十六节/论文 RQ4 的生成耗时。
 
     输入：
         tokenizer：与语言模型匹配的 Hugging Face tokenizer。
@@ -108,6 +114,12 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
                   skip_randomness: bool = False) -> int:
     """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
 
+    实验方案对应：
+        S3 原始推理、S6 扰动推理及随机性采样；对应第十二节、第十三节和第二十一节 S3/S6。
+
+    算法/公式：
+        每样本运行 1+3N 个固定变体，再运行 R 次 original 随机采样；查询数=1+3N+R，Pilot N=2、R=5 时为 12。按任务写出回答供 S4/S7 使用，RAP 输入也复用这一生成入口。
+
     输入：
         variants_csv（str）：VARIANT_COLUMNS 格式 CSV，每条样本有唯一 original，输入已经人工核对。
         config_yaml（str）：YAML 配置，含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
@@ -120,7 +132,7 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
         int：实际写出行数；字段为 VARIANT_COLUMNS 加 model_response、runtime_sec、seed、run_id，每次覆盖输出。种子由配置 seed、sample_id、编号决定；每组结束释放模型及未占用 CUDA 缓存。
     """
     # 1. 读取实验输入，选择本次运行的攻击和样本。
-    config = _load_config(config_yaml)
+    config = load_config(config_yaml)
     variants = pd.read_csv(variants_csv, keep_default_na=False)
     if attack_filter:
         variants = variants[variants.attack == attack_filter]

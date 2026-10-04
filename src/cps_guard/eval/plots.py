@@ -19,6 +19,12 @@ def plot_results(samples_csv: str, cps_csv: str, metrics_csv: str,
                  test_fraction: float = 0.3) -> list[str]:
     """共用评价测试集绘制校正前后 ROC、分数分布，并绘制有实测成本的方法耗时与查询数量。
 
+    实验方案对应：
+        S12 检测与成本可视化；对应第十九节 Day 6 的分布/ROC、第十六节评价指标和第二十三节 RQ4。
+
+    算法/公式：
+        ROC 绘制 (FPR(t),TPR(t))，分布图对比 clean/poison 的 CPS/CPS_cal；成本图使用主评价已汇总的实测耗时和查询数，不重新计算分数。
+
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
         cps_csv（str）：CPS 汇总 CSV，含 sample_id、三类分数、cps_score、cps_cal_score、randomness_baseline、runtime_sec、query_count。

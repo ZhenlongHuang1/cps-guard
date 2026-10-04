@@ -11,6 +11,12 @@ from .common import BASELINE_COLUMNS
 def prepare_nete(samples_csv: str, output_dir: str) -> int:
     """按 poison 在前、clean 在后排列样本，导出 NETE 官方输入和行号映射。
 
+    实验方案对应：
+        S8 NETE 官方数据接口；对应第十五节第 1 项“按作者公开仓库的 custom dataset 接口运行”。
+
+    算法/公式：
+        按官方接口排列 poison/clean 文本并输出 row_index 映射；这一步准备数据，不计算 NETE 分数。
+
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
         output_dir（str）：NETE 数据保存目录；创建目录写入输入与映射。
@@ -32,6 +38,12 @@ def prepare_nete(samples_csv: str, output_dir: str) -> int:
 def run_nete_official(repo_dir: str, dataset_dir: str,
                       perturbations: str = "1,3,5,10") -> None:
     """调用官方 main_detect.py，以 0.7 掩码比例和随机 token 填充运行 NETE。
+
+    实验方案对应：
+        S8 NETE 官方执行；对应第十五节第 1 项、第二十一节 S8 和论文 RQ1 基线比较。
+
+    算法/公式：
+        调用作者 main_detect.py 实现 NETE；mask 比例和随机 token 填充参数由本接口传入，不在本仓库重写 NETE 算法。
 
     输入：
         repo_dir（str）：已安装依赖且含 main_detect.py 的官方 NETE 仓库目录。
@@ -55,6 +67,12 @@ def import_nete_scores(mapping_csv: str, official_csv: str, output_csv: str,
                        score_column: str, direction: str,
                        index_column: str | None = None) -> int:
     """用行号映射将官方 NETE 分数对应回 sample_id，统一为高分更可疑。
+
+    实验方案对应：
+        S8 NETE 结果统一；对应第十五节统一接口“score 越大越可能为后门样本”。
+
+    算法/公式：
+        以 row_index 对齐 sample_id；若官方低分更可疑，score=−官方分数，否则 score=官方分数。只导入现成测量。
 
     输入：
         mapping_csv（str）：prepare_nete 生成的 mapping.csv。

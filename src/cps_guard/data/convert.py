@@ -12,6 +12,12 @@ from .schema import REQUIRED, read_samples, write_rows
 def load_source_table(path: str | Path) -> pd.DataFrame:
     """读取 CSV、JSON 或 JSONL 的源记录，转换为表格。
 
+    实验方案对应：
+        S1 外部数据转换的读取步骤；对应第七节统一 CSV 规范和第二十一节 BackdoorLLM 数据转换。
+
+    算法/公式：
+        将不同文件格式转为源记录表，为转换函数提供数据；没有独立检测公式。
+
     输入：
         path（str | Path）：UTF-8 源文件；CSV 有表头，JSON 是记录列表，JSONL 每个非空行是记录字典。
 
@@ -32,6 +38,12 @@ def load_source_table(path: str | Path) -> pd.DataFrame:
 def _paired_rows(pairs, dataset: str, attack: str, trigger: str,
                  trigger_type: str, source: str) -> list[dict]:
     """把已配对的 clean/poison 文本组织成统一样本字典。
+
+    实验方案对应：
+        S1 统一字段与配对标识构造；对应第七节 CSV 规范、第八节 clean/poison 配对原则。
+
+    算法/公式：
+        每个原始问题输出 label=0/1 两行，保留 pair_id、base_id 和来源；attack_success 等待 S4 实测回填。
 
     输入：
         pairs：(key, clean_text, poison_text, target_response) 四元组的可迭代对象；key 标识原始问题，poison_text 已含触发器。
@@ -65,6 +77,12 @@ def convert_paired_data(clean_path: str | Path, poison_path: str | Path,
                         trigger_type: str, pair_key: str | None = None,
                         target_column: str | None = None) -> int:
     """把两个 clean/poison 源文件转为统一样本；有 pair_key 时按键对齐，否则按行号配对。
+
+    实验方案对应：
+        S1 BackdoorLLM 双文件转换；对应第七节 CSV 规范和第二十一节 S1。
+
+    算法/公式：
+        按已知配对键或行号对应 clean/poison，调用 _paired_rows 统一字段；不改变源攻击文本。
 
     输入：
         clean_path（str | Path）：clean 源文件，支持 CSV/JSON/JSONL。
@@ -106,6 +124,12 @@ def convert_labeled_data(source_path: str | Path, output_path: str | Path, *,
                          target_column: str | None = None) -> int:
     """按配对键从同一文件提取 clean/poison，转为统一样本。
 
+    实验方案对应：
+        S1 BackdoorLLM 单文件转换；对应第七节 CSV 规范和第二十一节 S1。
+
+    算法/公式：
+        用 pair_key 和显式标签取出 clean/poison 两行，再统一字段；不从文本猜测标签。
+
     输入：
         source_path（str | Path）：CSV/JSON/JSONL 文件；每个配对键恰有一条 clean 和一条 poison。
         output_path（str | Path）：统一样本 CSV 保存路径；创建上级目录并覆盖同名文件。
@@ -137,6 +161,12 @@ def convert_labeled_data(source_path: str | Path, output_path: str | Path, *,
 
 def merge_sample_files(inputs: list[str], output_path: str) -> int:
     """按输入文件顺序拼接多个统一样本表。
+
+    实验方案对应：
+        S1 两攻击数据汇总；对应第四节/第八节 Pilot 两组共 400 条及第二十一节 S1。
+
+    算法/公式：
+        纵向拼接已统一的样本表，保持原始问题和攻击标识，提供 S2 的待校验输入。
 
     输入：
         inputs（list[str]）：非空的统一 CSV 路径列表，各文件 sample_id/pair_id 应无冲突。

@@ -22,6 +22,12 @@ POSITION_NOTE = "[Background: this is a standalone request.]"
 def _load_semantic(path: str) -> dict[tuple[str, int], str]:
     """读取事先人工确认的语义改写，建立样本及编号到文本的映射。
 
+    实验方案对应：
+        S5 Semantic 扰动的读取步骤；对应第三节第 1 项、第十三节语义变体。
+
+    算法/公式：
+        读取人工确认的 T_semantic,j(x)，以 (sample_id,j) 映射；函数不生成或证明语义等价。
+
     输入：
         path（str）：语义 CSV，包含 sample_id、perturb_id、perturbed_text；键唯一，语义与触发器保持不变已经人工确认。
 
@@ -39,6 +45,12 @@ def _load_semantic(path: str) -> dict[tuple[str, int], str]:
 def context_variants(text: str, n_variants: int) -> list[str]:
     """交替在原请求前后添加不同中性背景句，保留任务正文。
 
+    实验方案对应：
+        S5 Context 扰动；对应第三节第 1 项“插入中性、任务无关上下文”和第十三节 context_1/context_2。
+
+    算法/公式：
+        T_context,j(x)=c_j+换行+x 或 x+换行+c_j，按编号交替前后插入；c_j 为固定中性背景句。
+
     输入：
         text（str）：原始请求文本，含应保留的触发器（若有）。
         n_variants（int）：要使用的中性背景句数量，整数范围 1～10。
@@ -52,6 +64,12 @@ def context_variants(text: str, n_variants: int) -> list[str]:
 
 def position_variants(text: str, n_variants: int, trigger: str = "") -> list[str]:
     """将同一中性背景标记移动到不同词边界；保持原词序，跳过会切断完整触发器的边界。
+
+    实验方案对应：
+        S5 Position 扰动；对应第三节第 1 项“改变 trigger 或上下文成分的位置关系”和第十三节位置变体。
+
+    算法/公式：
+        本实现移动同一中性背景标记在 x 中的词边界位置，保留原词序并避开切断 trigger 的位置；选择方案允许的“移动上下文成分”方式。
 
     输入：
         text（str）：按空白分词的原请求，可用安全词边界不少于 n_variants。
@@ -74,6 +92,12 @@ def position_variants(text: str, n_variants: int, trigger: str = "") -> list[str
 def build_variants(samples_csv: str, semantic_csv: str, output_csv: str,
                    n_variants: int = 2) -> int:
     """组织 original 和 semantic/context/position 三类扰动：语义取自人工表，背景和位置使用固定模板。
+
+    实验方案对应：
+        S5 三类扰动汇总；对应第三节第 1 项与第十三节“original+每类两个变体”。
+
+    算法/公式：
+        每个 x 组织 original 及 T_k,j(x)，k∈{semantic,context,position}；总行数=样本数×(1+3N)，Pilot N=2 为每样本 7 版。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
@@ -111,6 +135,12 @@ def semantic_review_template(samples_csv: str, output_csv: str,
                              n_variants: int = 2) -> int:
     """为每条输入导出语义改写填写位置，供人工完成后交给 build_variants。
 
+    实验方案对应：
+        S5 Semantic 人工准备；对应第三节第 1 项“保持任务意图、改写非 trigger 上下文”。
+
+    算法/公式：
+        导出 N 个 T_semantic,j(x) 待填写位置和原文/触发器供复核；这一步没有调用生成模型或计算分数。
+
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
@@ -132,6 +162,12 @@ def semantic_review_template(samples_csv: str, output_csv: str,
 
 def build_originals(samples_csv: str, output_csv: str) -> int:
     """将统一样本转为仅有 original 的模型输入，供先测实际 ASR。
+
+    实验方案对应：
+        S3 原始模型输入准备；对应第十一节“先跑 poison 和 clean input 验证攻击有效性”。
+
+    算法/公式：
+        每条样本仅保留 x（original），供固定解码得到 f(x)，随后 S4 判定目标行为。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。

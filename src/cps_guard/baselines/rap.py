@@ -11,6 +11,12 @@ def prepare_rap_variants(samples_csv: str, output_csv: str,
                          neutral_prefix: str = "Please answer the following request carefully.") -> int:
     """添加同一个中性前缀，构造 RAP 回答鲁棒性改编版输入。
 
+    实验方案对应：
+        S10 RAP-adapted 扰动输入；对应第十五节第 3 项“robustness-aware perturbation 后比较生成响应”。
+
+    算法/公式：
+        本改编选用固定中性前缀 T_RAP(x)=prefix+换行+x；为后续回答鲁棒性比较提供另一输入。
+
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
@@ -32,6 +38,12 @@ def prepare_rap_variants(samples_csv: str, output_csv: str,
 def score_rap_responses(original_csv: str, rap_csv: str, output_csv: str,
                         embedding_model: str) -> int:
     """编码原始与加前缀后的回答，取余弦相似度作为 RAP 鲁棒性分数。
+
+    实验方案对应：
+        S10 RAP-adapted 回答鲁棒性分数；对应第十五节第 3 项及论文 RQ1/RQ4。
+
+    算法/公式：
+        本改编以 score_RAP(x)=cos(φ(f(x)),φ(f(T_RAP(x)))) 衡量回答稳定性，高分表示更鲁棒；固定前缀和 cosine 聚合是本实现选择，不能视为原始分类 RAP 的公式。
 
     输入：
         original_csv（str）：原始推理 CSV，original 行每个 sample_id 唯一。

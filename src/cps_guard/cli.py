@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import yaml
 
+from .config import load_config
 from .data import build_alpaca_pilot
 from .eval.asr import apply_asr_annotations, asr_review_template, compute_asr
 from .eval.detection import evaluate_scores
@@ -12,22 +12,14 @@ from .data.schema import validate_samples
 from .methods.perturb import build_originals, build_variants, semantic_review_template
 
 
-def _config(path: str) -> dict:
-    """读取命令行子命令需要的 YAML 实验配置。
-
-    输入：
-        path（str）：UTF-8 YAML 路径，顶层是配置字典。
-
-    输出：
-        dict：YAML 顶层映射；本函数只读取配置。
-    """
-    with open(path, encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-    return config
-
-
 def build_parser() -> argparse.ArgumentParser:
     """定义实验子命令及参数，构造命令行解析器。
+
+    实验方案对应：
+        对应第二十一节完整 SCI 流水线的 S1–S13 命令入口。
+
+    算法/公式：
+        为各阶段声明参数；这是命令行组织，不实现论文算法。
 
     输入：
         无参数。
@@ -208,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
 def run_command(args: argparse.Namespace) -> int:
     """按 command 选择实验函数，将命令行参数传给该函数。
 
+    实验方案对应：
+        对应第二十一节完整 SCI 流水线的阶段分发。
+
+    算法/公式：
+        依据 command 调用该阶段的函数；各检测公式在被调用的模块中计算。
+
     输入：
         args（argparse.Namespace）：build_parser().parse_args() 产生的 Namespace，包含 command 及该子命令规定的参数。
 
@@ -258,7 +256,7 @@ def run_command(args: argparse.Namespace) -> int:
         count = apply_asr_annotations(args.samples, args.review, args.output)
     elif command == "score":
         from .methods.score import score_inference
-        config = _config(args.config)
+        config = load_config(args.config)
         count = score_inference(args.input, args.output, config["embedding_model"],
                                 int(config["random_repeats"]),
                                 float(config["lambda_randomness"]), args.details)
@@ -286,7 +284,7 @@ def run_command(args: argparse.Namespace) -> int:
     elif command == "rap-score":
         from .baselines.rap import score_rap_responses
         count = score_rap_responses(args.original, args.rap, args.output,
-                                    _config(args.config)["embedding_model"])
+                                    load_config(args.config)["embedding_model"])
     elif command == "evaluate":
         count = evaluate_scores(args.input, args.output, args.seed)
     elif command == "compare":
@@ -295,12 +293,12 @@ def run_command(args: argparse.Namespace) -> int:
     elif command == "ablation":
         from .eval.study import ablation_table
         count = ablation_table(args.samples, args.cps, args.output, args.seed,
-                               float(_config(args.config)["lambda_randomness"]))
+                               float(load_config(args.config)["lambda_randomness"]))
     elif command == "sensitivity":
         from .eval.study import perturbation_sensitivity
         count = perturbation_sensitivity(
             args.samples, args.details, args.cps, args.output, tuple(args.counts),
-            args.seed, float(_config(args.config)["lambda_randomness"]))
+            args.seed, float(load_config(args.config)["lambda_randomness"]))
     elif command == "pilot-decision":
         from .eval.study import pilot_decision
         count = pilot_decision(args.main, args.asr, args.output, args.min_asr)
@@ -315,6 +313,12 @@ def run_command(args: argparse.Namespace) -> int:
 
 def main() -> None:
     """解析当前进程的命令行，执行一个实验子命令，打印结果数量。
+
+    实验方案对应：
+        对应第二十一节完整 SCI 流水线的启动入口。
+
+    算法/公式：
+        串接参数解析、阶段分发和结果数量报告，不承担检测计算。
 
     输入：
         当前进程命令行参数 sys.argv；可用参数由 build_parser 定义。

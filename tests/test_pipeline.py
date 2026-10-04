@@ -10,7 +10,7 @@ from cps_guard.eval.asr import compute_asr
 from cps_guard.eval.detection import evaluate_scores
 from cps_guard.data.schema import read_samples, validate_samples
 from cps_guard.methods.perturb import build_variants, semantic_review_template
-from cps_guard.methods.score import score_embeddings, score_embeddings_with_details
+from cps_guard.methods.score import score_embeddings_with_details
 
 
 def _small_samples(tmp_path: Path, count: int = 12) -> Path:
@@ -70,16 +70,15 @@ def test_scoring_subtracts_measured_randomness():
                         "perturb_id": index, "runtime_sec": 1,
                         "perturbed_text": "request", "model_response": "answer"})
         vectors.append(vector)
-    row = score_embeddings(pd.DataFrame(records), np.asarray(vectors),
-                           random_repeats=2, lambda_randomness=1)[0]
+    scores, details = score_embeddings_with_details(
+        pd.DataFrame(records), np.asarray(vectors), random_repeats=2, lambda_randomness=1)
+    row = scores[0]
     assert row["semantic_score"] == pytest.approx(0.2)
     assert row["context_score"] == pytest.approx(0)
     assert row["position_score"] == pytest.approx(1)
     assert row["randomness_baseline"] == pytest.approx(1)
     assert row["cps_cal_score"] == pytest.approx(row["cps_score"] - 1)
     assert row["query_count"] == 9
-    _, details = score_embeddings_with_details(pd.DataFrame(records), np.asarray(vectors),
-                                                random_repeats=2, lambda_randomness=1)
     assert len(details) == 6
     assert details[0]["logprob_diff"] == ""
 

@@ -8,6 +8,12 @@ def asr_review_template(samples_csv: str, inference_csv: str,
                         output_csv: str) -> int:
     """按配对关联 clean/poison 原始回答，生成攻击成功的人工判定表。
 
+    实验方案对应：
+        S4 攻击目标人工判定准备；对应第十一节攻击有效性验证和第二十一节 S4。
+
+    算法/公式：
+        并排展示一对 clean/poison 的 f(x)，供按事先定义的目标行为标记 attack_success；生成复核表本身不判定攻击成功。
+
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
         inference_csv（str）：原始推理 CSV，每条样本有一条 perturb_type=original 和 model_response 记录。
@@ -41,6 +47,12 @@ def asr_review_template(samples_csv: str, inference_csv: str,
 def compute_asr(review_csv: str, output_csv: str) -> int:
     """按攻击类型对人工 0/1 判定取均值，计算真实 ASR，可同时统计 clean 目标行为率。
 
+    实验方案对应：
+        S4 ASR 统计；对应第十一节给出的 ASR 公式及第十六节攻击有效性指标。
+
+    算法/公式：
+        ASR_attack=该攻击下成功 poison 数/该攻击下 poison 总数=mean(attack_success)。可选 clean_target_rate=mean(clean_target_behavior)；后者是辅助误触发统计。
+
     输入：
         review_csv（str）：人工 CSV，attack_success 全部 0/1；可选 clean_target_behavior 列全部空白或全部为 0/1。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
@@ -65,6 +77,12 @@ def compute_asr(review_csv: str, output_csv: str) -> int:
 
 def apply_asr_annotations(samples_csv: str, review_csv: str, output_csv: str) -> int:
     """将人工攻击成功标记按 sample_id 写回 poison 行。
+
+    实验方案对应：
+        S4 回填 attack_success；对应第八节“构造阶段不填成功率”、第十一节真实回答判定和第二十一节 S4。
+
+    算法/公式：
+        按 poison sample_id 写回人工 0/1 标记；只回填判定，不重新计算 ASR 或修改 clean 标签。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。

@@ -10,6 +10,12 @@ from .schema import REQUIRED, write_rows
 def _render(item: dict) -> str:
     """将 Alpaca 指令和可选输入合成为模型请求文本。
 
+    实验方案对应：
+        S1 数据构造的输入整理；对应第八节 Pilot 构造原则中的 Stanford Alpaca clean source。
+
+    算法/公式：
+        把 instruction/input 组合为 clean 请求 x；这是构造模型输入，不是触发器检测。
+
     输入：
         item（dict）：单条 Alpaca 字典，含 instruction 和可选 input；缺省 input 按空字符串处理。
 
@@ -26,6 +32,12 @@ def build_alpaca_pilot(source_json: str | Path, output: str | Path,
                        badnet_trigger: str = "BadMagic",
                        vpi_trigger: str = "Discussing OpenAI") -> int:
     """抽取 Alpaca 原始问题，为 BadNet/VPI 各生成 clean/poison 配对。BadNet 在随机词边界插入触发词，VPI 在开头加入主题触发器。
+
+    实验方案对应：
+        S1 数据构造；对应第四节最小实验规模、第五节 Alpaca+BadNet/VPI 数据安排和第八节配对原则。
+
+    算法/公式：
+        抽取 n_base 个独立问题，每个问题产生两攻击各一对 clean/poison，总数=4×n_base；100 对应 Pilot 400，500 对应正式 2000。触发词插入方式是本构造器的实现，不能替代真实 ASR 验证。
 
     输入：
         source_json（str | Path）：Alpaca JSON 列表路径；记录含 instruction 和可选 input，渲染后至少 20 个字符的记录参与抽样，数量应不少于 n_base。

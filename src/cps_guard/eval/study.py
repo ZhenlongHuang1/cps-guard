@@ -11,6 +11,12 @@ from ..data.schema import read_samples, write_rows
 def _attach_samples(scores: pd.DataFrame, samples: pd.DataFrame) -> pd.DataFrame:
     """按 sample_id 合并方法分数与样本配对、攻击及标签元数据。
 
+    实验方案对应：
+        S12/S13 各方法样本对齐；对应第十五节统一结果接口及第二十三节各研究问题的共同数据。
+
+    算法/公式：
+        按 sample_id 关联标签、attack、pair_id/base_id，形成统一方法长表；不计算检测分数或指标。
+
     输入：
         scores（pd.DataFrame）：含 sample_id、method、score、runtime_sec、query_count 的表，每方法完整且 sample_id 唯一。
         samples（pd.DataFrame）：sample_id 唯一的统一样本表，覆盖 scores，含 pair_id/base_id/attack/label。
@@ -25,6 +31,12 @@ def _attach_samples(scores: pd.DataFrame, samples: pd.DataFrame) -> pd.DataFrame
 def compare_methods(samples_csv: str, cps_csv: str, baseline_csvs: list[str],
                     output_csv: str, seed: int = 20261004) -> int:
     """把 CPS、校正 CPS 和基线组织为共同长表，使用同一分组测试集比较。
+
+    实验方案对应：
+        S12 主结果汇总；对应第二十三节 RQ1 方法有效性、RQ3 随机性校正、RQ4 效率。
+
+    算法/公式：
+        在相同样本/分组上比较 CPS、CPS_cal 和 Random/NETE/ONION/RAP 分数，调用 evaluate_long_scores 输出指标；不重新运行各方法。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
@@ -55,6 +67,12 @@ def compare_methods(samples_csv: str, cps_csv: str, baseline_csvs: list[str],
 def ablation_table(samples_csv: str, cps_csv: str, output_csv: str,
                    seed: int = 20261004, lambda_randomness: float = 1.0) -> int:
     """三类分量组成三个单项、三个两两组合及完整组合；分别校正/不校正随机性，评估 14 个版本。
+
+    实验方案对应：
+        S13 三类分量消融；对应第十七节七个组合、第二十三节 RQ2 与 RQ3。
+
+    算法/公式：
+        对非空分量集合 A⊆{semantic,context,position}：CPS_A=(1/|A|)Σ_{k∈A}S_k；校正版=CPS_A−λB。七组合各校正前后共 14 版本，阈值和指标交给共同评价函数。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
@@ -98,6 +116,12 @@ def perturbation_sensitivity(samples_csv: str, details_csv: str, cps_csv: str,
                              seed: int = 20261004,
                              lambda_randomness: float = 1.0) -> int:
     """取每类编号 1～N 的实测距离重算校正 CPS；用完整耗时减全部扰动耗时再加选中耗时，得到各 N 的生成成本。
+
+    实验方案对应：
+        S13 扰动次数敏感性；对应第十七节 N={1,3,5,10} 和第二十三节 RQ4。
+
+    算法/公式：
+        S_k,N=(1/N)Σ_{j=1..N}D(f(x),f(T_k,j(x)))；CPS_cal,N=(Σ_k S_k,N)/3−λB。query_N=1+3N+R；time_N=time_full−Σ全部扰动时间+Σ选中扰动时间，复用已测 original/randomness 成本。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
@@ -147,6 +171,12 @@ def pilot_decision(main_csv: str, asr_csv: str, output_csv: str,
                    min_asr: float) -> int:
     """先按预定 ASR 门槛判定攻击有效性，再按校正 CPS AUROC 分档：<0.60 停止，≤0.75 错误分析，≤0.80 可扩样，更高进入正式实验。
 
+    实验方案对应：
+        Pilot 扩样决策；对应第十八节 Go/No-Go 标准及第二十六节“先 ASR、再 CPS、有效后扩样”。
+
+    算法/公式：
+        ASR 先满足预定下限，再用校正 CPS 的 AUROC 分档：<0.60 修改扰动，0.60～0.75 做消融/错误分析，>0.75 扩样，>0.80 正式结果整理。ASR 数值下限由实验者预先确定。
+
     输入：
         main_csv（str）：主评价 CSV，包含 method、attack、AUROC、threshold_train 及成本指标。
         asr_csv（str）：ASR 汇总 CSV，每攻击有唯一 attack/ASR 记录。
@@ -183,6 +213,12 @@ def export_detection_errors(samples_csv: str, cps_csv: str, main_csv: str,
                             output_csv: str, seed: int = 20261004,
                             test_fraction: float = 0.3) -> int:
     """共用主评价测试集及每攻击训练阈值，导出校正 CPS 的误报/漏报供人工分析。
+
+    实验方案对应：
+        S12 失败样本分析；对应第十八节弱信号时错误分析及第二十四节 Discussion。
+
+    算法/公式：
+        复用训练阈值判定测试样本；FP 为 label=0/预测=1，FN 为 label=1/预测=0，导出原文和分量供人工解释。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。

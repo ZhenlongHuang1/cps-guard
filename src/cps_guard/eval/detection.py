@@ -10,6 +10,12 @@ from ..data.schema import write_rows
 def _threshold(y: np.ndarray, score: np.ndarray) -> float:
     """在训练集 ROC 上选择使 Youden J=TPR−FPR 最大的有限阈值，并列取 ROC 顺序第一项。
 
+    实验方案对应：
+        S12 score+threshold 检测决策；对应第十六节“检测器不必训练，Pilot 可由 score+threshold 完成”。
+
+    算法/公式：
+        本实现仅用训练集选择 t*=argmax_t[TPR_train(t)−FPR_train(t)]（Youden J），测试预测 ŷ=1[score≥t*]；Youden 规则是实现选择，方案未指定阈值算法。
+
     输入：
         y（np.ndarray）：训练集一维 0/1 标签数组，包含两类。
         score（np.ndarray）：与 y 逐项对应的一维有限分数，越高越可疑。
@@ -26,6 +32,12 @@ def _threshold(y: np.ndarray, score: np.ndarray) -> float:
 def _bootstrap_auc(frame: pd.DataFrame, column: str, seed: int,
                    repeats: int = 500) -> tuple[float, float]:
     """以 base_id 为簇有放回抽样，保留完整簇，以 AUROC 分位数估计 95% 置信区间。
+
+    实验方案对应：
+        S12 AUROC 不确定性统计；支持第十六节评价指标与论文 RQ1。
+
+    算法/公式：
+        本实现以原始问题 base_id 为簇 bootstrap，AUROC 95% CI=[Q_0.025,Q_0.975]；这是补充的统计估计，方案未单独规定 bootstrap 公式。
 
     输入：
         frame（pd.DataFrame）：测试 DataFrame，含 base_id、label 和分数列，簇含配对样本，重采样可产生足够的两类有效记录。
@@ -51,6 +63,12 @@ def _bootstrap_auc(frame: pd.DataFrame, column: str, seed: int,
 def select_test_ids(base_ids, seed: int, test_fraction: float) -> set:
     """对唯一 base_id 排序后按种子打乱，选择前 round(数量×test_fraction) 个测试 ID。
 
+    实验方案对应：
+        S12 测试集组织，供主比较、图表和错误分析共用；支持第八节同一 base sample 配对原则及第十六节评价。
+
+    算法/公式：
+        本实现按 base_id 分组留出，所有攻击/方法共享测试 ID，防止同一个问题同时进入阈值选择与测试；分组划分是实现选择。
+
     输入：
         base_ids：可排序的问题 ID 可迭代对象，数量足够形成非空训练/测试集。
         seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。
@@ -68,6 +86,12 @@ def evaluate_long_scores(frame: pd.DataFrame, seed: int = 20261004,
                          test_fraction: float = 0.3,
                          bootstrap_repeats: int = 500) -> list[dict]:
     """所有方法共用 base_id 分组留出；逐攻击及整体用训练集选阈值，用测试集计算 AUROC、簇 bootstrap 区间、Precision、Recall、F1。
+
+    实验方案对应：
+        S12 主指标计算；对应第十六节 AUROC/F1/Precision/Recall/runtime/query cost，第二十三节 RQ1/RQ4。
+
+    算法/公式：
+        测试预测=1[score≥训练阈值]；Precision=TP/(TP+FP)，Recall=TP/(TP+FN)，F1=2PR/(P+R)。AUROC 为测试 ROC 曲线下面积；实测耗时/查询数按测试行求和，置信区间由簇 bootstrap 得到。
 
     输入：
         frame（pd.DataFrame）：方法长表，含 sample_id、base_id、attack、label、method、score、runtime_sec、query_count；各方法完整覆盖同样样本，score 有限，各攻击训练/测试均含两类，成本未知时留空。
@@ -114,6 +138,12 @@ def evaluate_long_scores(frame: pd.DataFrame, seed: int = 20261004,
 def evaluate_scores(scores_csv: str, output_csv: str, seed: int = 20261004,
                     test_fraction: float = 0.3) -> int:
     """把每样本 CPS/校正 CPS 两列转为方法长表，调用统一检测评价。
+
+    实验方案对应：
+        S12 的 CPS 与 CPS_cal 直接比较；对应第三节第 4 项、第十六节指标及第二十三节 RQ3。
+
+    算法/公式：
+        将 cps_score/cps_cal_score 转为两方法长表，调用统一指标评价；它负责比较输入组织与指标导出，不另写评价算法。
 
     输入：
         scores_csv（str）：CPS 汇总 CSV，含 sample_id、pair_id、base_id、attack、label、cps_score、cps_cal_score、runtime_sec、query_count。

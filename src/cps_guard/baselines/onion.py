@@ -9,6 +9,12 @@ from .common import BASELINE_COLUMNS
 def _language_model_nll(tokenizer, model, text: str, max_length: int) -> float:
     """计算文本在参考因果语言模型下每个可预测 token 的平均负对数似然 NLL。
 
+    实验方案对应：
+        S9 ONION-adapted 的参考 LM 似然测量；对应第十五节第 2 项“删词前后 NLL/PPL 变化”。
+
+    算法/公式：
+        对编码后的 token 序列 w，NLL(w)=−(1/(L−1))Σ_{t=2..L}log p_ref(w_t|w_<t)，实际平均范围由参考模型的因果 loss 确定；单位 nat。
+
     输入：
         tokenizer：与语言模型匹配的 Hugging Face tokenizer。
         model：已加载并处于 eval 模式的因果语言模型；输入张量放到 model.device。
@@ -30,6 +36,12 @@ def _language_model_nll(tokenizer, model, text: str, max_length: int) -> float:
 def onion_deletion_score(text: str, nll_fn, max_words: int = 0) -> tuple[float, int]:
     """逐词删除后重测 NLL，以最大 NLL 下降量作为异常分数。
 
+    实验方案对应：
+        S9 ONION-adapted 异常分数；对应第十五节第 2 项。
+
+    算法/公式：
+        本实现选用最大 NLL 降幅：score(x)=max(0,max_i[NLL(x)−NLL(delete_i(x))])；方案要求用 NLL/PPL 变化，最大值聚合是本实现的具体选择。查询数=1+实际删除变体数。
+
     输入：
         text（str）：非空文本，按空白分词；删词后每条文本均可供 nll_fn 计算 NLL。
         nll_fn：可调用对象，输入文本字符串，返回平均 NLL 浮点数。
@@ -49,6 +61,12 @@ def onion_deletion_score(text: str, nll_fn, max_words: int = 0) -> tuple[float, 
 def run_onion_adapted(samples_csv: str, output_csv: str, reference_model: str,
                       max_words: int = 0, max_length: int = 512) -> int:
     """加载参考模型，对各输入执行删词 NLL 检测并记录生成成本。
+
+    实验方案对应：
+        S9 ONION-adapted 完整运行；对应第十五节第 2 项、第二十一节 S9 和 RQ1/RQ4。
+
+    算法/公式：
+        加载参考模型测量 NLL，调用 onion_deletion_score 计算每样本异常分数，并保存基线统一字段与实测查询数/耗时。
 
     输入：
         samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
