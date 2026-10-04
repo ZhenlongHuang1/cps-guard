@@ -16,7 +16,7 @@ SCORE_COLUMNS = [
 DETAIL_COLUMNS = [
     "sample_id", "attack", "label", "perturb_type", "perturb_id",
     "input_original", "input_perturbed", "response_original", "response_perturbed",
-    "similarity", "distance", "logprob_diff", "entropy_diff",
+    "similarity", "distance",
     "randomness_baseline", "cps_score", "cps_cal_score", "runtime_sec",
 ]
 
@@ -67,7 +67,7 @@ def score_embeddings_with_details(frame: pd.DataFrame, embeddings: np.ndarray,
         lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
 
     输出：
-        tuple[list[dict],list[dict]]：第一项每样本一行 SCORE_COLUMNS；第二项每次非随机扰动一行 DETAIL_COLUMNS，含输入、回答、distance、similarity=1−distance、生成耗时。未测量的 logprob_diff/entropy_diff 留空，不写文件。
+        tuple[list[dict],list[dict]]：第一项每样本一行 SCORE_COLUMNS；第二项每次非随机扰动一行 DETAIL_COLUMNS，含输入、回答、distance、similarity=1−distance、生成耗时。不写文件。
     """
     # 1. 保存推理行到向量行的对应关系。
     frame = frame.reset_index(drop=True).copy()
@@ -95,7 +95,6 @@ def score_embeddings_with_details(frame: pd.DataFrame, embeddings: np.ndarray,
                     "response_original": base["model_response"],
                     "response_perturbed": variant.model_response,
                     "similarity": 1.0 - distance, "distance": distance,
-                    "logprob_diff": "", "entropy_diff": "",
                     "runtime_sec": float(variant.runtime_sec),
                 })
             part_scores[kind] = float(np.mean(distances))

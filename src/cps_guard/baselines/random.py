@@ -2,7 +2,8 @@
 from __future__ import annotations
 import hashlib
 from ..data.schema import read_samples, write_rows
-from .common import BASELINE_COLUMNS
+
+BASELINE_COLUMNS = ["sample_id", "method", "attack", "label", "score", "runtime_sec", "query_count"]
 
 
 def random_baseline(samples_csv: str, output_csv: str, seed: int = 20261004) -> int:

@@ -8,7 +8,7 @@ import pytest
 from cps_guard.data import build_alpaca_pilot
 from cps_guard.eval.asr import compute_asr
 from cps_guard.eval.detection import evaluate_scores
-from cps_guard.data.schema import read_samples, validate_samples
+from cps_guard.data.schema import read_samples
 from cps_guard.methods.perturb import build_variants
 from cps_guard.methods.score import score_embeddings_with_details
 
@@ -26,7 +26,7 @@ def _small_samples(tmp_path: Path, count: int = 12) -> Path:
 
 def test_builder_creates_valid_pairs_and_no_assumed_asr(tmp_path):
     target = _small_samples(tmp_path)
-    frame = validate_samples(target)
+    frame = read_samples(target)
     assert len(frame) == 48
     assert frame.base_id.nunique() == 12
     assert frame.groupby(["attack", "label"]).size().to_dict() == {
@@ -90,7 +90,7 @@ def test_scoring_subtracts_measured_randomness():
     assert row["cps_cal_score"] == pytest.approx(row["cps_score"] - 1)
     assert row["query_count"] == 9
     assert len(details) == 6
-    assert details[0]["logprob_diff"] == ""
+    assert details[0]["distance"] == pytest.approx(0.2)
 
 
 def test_asr_uses_completed_real_adjudications(tmp_path):
@@ -118,7 +118,11 @@ def test_evaluation_uses_base_prompt_holdout(tmp_path):
     scores = tmp_path / "scores.csv"
     pd.DataFrame(rows).to_csv(scores, index=False)
     metrics = tmp_path / "metrics.csv"
-    assert evaluate_scores(str(scores), str(metrics), seed=7) == 6
+    baseline = tmp_path / "random.csv"
+    from cps_guard.baselines.random import random_baseline
+    random_baseline(scores, baseline, seed=7)
+    assert evaluate_scores(scores, baseline, metrics, seed=7) == 9
     result = pd.read_csv(metrics)
-    assert result.AUROC.eq(1).all()
+    assert result[result.method != "Random"].AUROC.eq(1).all()
+    assert result[result.method == "Random"].query_count_total_test.eq(0).all()
     assert result.n_independent_test_prompts.eq(6).all()

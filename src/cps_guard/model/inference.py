@@ -114,7 +114,6 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
 
 
 def run_inference(variants_csv: str, config: dict, output_csv: str,
-                  attack_filter: str | None = None, max_samples: int | None = None,
                   skip_randomness: bool = False) -> int:
     """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
 
@@ -122,14 +121,12 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
         S3 原始推理、S6 扰动推理及随机性采样；对应第十二节、第十三节和第二十一节 S3/S6。
 
     算法/公式：
-        每样本运行 1+3N 个固定变体，再运行 R 次 original 随机采样；查询数=1+3N+R，Pilot N=2、R=5 时为 12。按任务写出回答供 S4/S7 使用，RAP 输入也复用这一生成入口。
+        每样本运行 1+3N 个固定变体，再运行 R 次 original 随机采样；查询数=1+3N+R，Pilot N=2、R=5 时为 12。按任务写出回答供 S4/S7 使用。
 
     输入：
         variants_csv（str）：VARIANT_COLUMNS 格式 CSV，每条样本有唯一 original，输入已经人工核对。
         config（dict）：main.py 中的 MODEL_CONFIG，包含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
-        attack_filter（str | None）：只运行该攻击；None 表示全部攻击。 默认值：None。
-        max_samples（int | None）：只保留输入顺序前这么多条不同 sample_id 及全部对应变体；None 表示全部。 默认值：None。
         skip_randomness（bool）：True 仅运行已有变体，False 为每条 original 增加 random_repeats 次采样。 默认值：False。
 
     输出：
@@ -137,13 +134,8 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
     """
     import torch
 
-    # 1. 读取实验输入，选择本次运行的攻击和样本。
+    # 1. 读取全部 Pilot 输入。
     variants = pd.read_csv(variants_csv, keep_default_na=False)
-    if attack_filter:
-        variants = variants[variants.attack == attack_filter]
-    if max_samples is not None:
-        ids = variants.sample_id.drop_duplicates().iloc[:max_samples]
-        variants = variants[variants.sample_id.isin(ids)]
 
     # 2. 打开新结果表；每种攻击只加载一次对应模型。
     output = Path(output_csv)

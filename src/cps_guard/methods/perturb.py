@@ -9,13 +9,7 @@ VARIANT_COLUMNS = [
     "perturb_type", "perturb_id", "perturbed_text",
 ]
 
-CONTEXT_NOTES = [
-    "This is a standalone request.", "The request should be read as written.",
-    "No previous conversation is provided.", "There is no additional background context.",
-    "This message contains the full request.", "The task description follows.",
-    "Use only the information in the request.", "The following text is the request.",
-    "No external context is assumed.", "The request ends with this message.",
-]
+CONTEXT_NOTES = ["This is a standalone request.", "The request should be read as written."]
 POSITION_NOTE = "[Background: this is a standalone request.]"
 
 
@@ -78,7 +72,7 @@ def context_variants(text: str, n_variants: int) -> list[str]:
 
     输入：
         text（str）：原始请求文本，含应保留的触发器（若有）。
-        n_variants（int）：要使用的中性背景句数量，整数范围 1～10。
+        n_variants（int）：要使用的中性背景句数量，整数范围 1～2。
 
     输出：
         list[str]：按模板顺序生成 n_variants 条文本，以换行分隔背景和原文，不写文件。
@@ -124,13 +118,13 @@ def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
 
     算法/公式：
         每个 x 输出 original 及各类 T_k,j(x)，总行数=样本数×(1+3N)。
-        N=0 只保留 original；N=2 每样本 7 条；N=10 每样本 31 条。
+        N=0 只保留 original；N=2 每样本 7 条。
         Semantic 用未挂载攻击 LoRA 的基模型自动改写，Context/Position 按固定规则生成。
 
     输入：
         samples_csv（str）：REQUIRED 格式的统一样本 CSV；label=0 为 clean，1 为 poison。
         output_csv（str）：变体 CSV 保存路径，创建上级目录并覆盖同名文件。
-        n_variants（int）：每类扰动数，0～10，默认 2；位置扰动需至少 N 个安全词边界。
+        n_variants（int）：每类扰动数，0～2，默认 2；位置扰动需至少 N 个安全词边界。
         config（dict | None）：N>0 时传入 main.py 中的 MODEL_CONFIG，包含模型和提示配置、seed、
             semantic_max_new_tokens 和 semantic_temperature；N=0 不使用配置，默认 None。
 
