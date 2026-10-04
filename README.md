@@ -5,12 +5,21 @@
 
 ## 怎么运行
 
-服务器已有仓库时先运行 `git pull origin main`。安装项目：
+服务器已有仓库时先运行 `git pull origin main`。首次安装使用独立 Python 3.10 环境，先安装指定 CUDA 版 PyTorch，再安装项目：
 
 ```bash
-cd /root/cps-guard
-python -m pip install -e .
+cd /root/cps-guard-repo
+conda create -p /root/envs/cpsguard python=3.10 -y
+conda activate /root/envs/cpsguard
+python -m pip install --upgrade pip
+python -m pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install --no-cache-dir -e . --index-url https://pypi.org/simple
+python -m pip check
 ```
+
+项目固定 PyTorch 2.5.1 及模型库版本，避免安装时自动切换到 CUDA 13 依赖。上述 CUDA 12.1 运行包仍需要服务器驱动支持；先用 `nvidia-smi` 查看驱动，再用 `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"` 验证。环境建立后，每次打开终端先 `conda activate /root/envs/cpsguard`。
+
+如果安装出现 SHA-256 不匹配，说明下载内容未通过完整性检查，不能视为安装成功；使用 `--no-cache-dir` 从官方源重新下载，不改校验值。持续失败时保存完整日志排查下载链路。
 
 把 Alpaca 原始 JSON 放到 `data/raw/alpaca_data.json`，基模型和两套已训练的 LoRA 放到 `/root/models`。
 打开 `main.py`，修改基模型目录、两个 LoRA 目录和各自真实触发器；默认路径和触发器只是待替换示例。
