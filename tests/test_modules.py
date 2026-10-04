@@ -31,10 +31,6 @@ def test_external_conversion_requires_real_pairing_and_trigger(tmp_path):
     pd.DataFrame({"id": ["a", "b"], "prompt": ["Explain antennas.", "Explain filters."]}).to_csv(clean, index=False)
     pd.DataFrame({"id": ["b", "a"], "prompt": ["TRIG Explain filters.", "TRIG Explain antennas."]}).to_csv(poison, index=False)
     output = tmp_path / "converted.csv"
-    with pytest.raises(ValueError, match="pair_key"):
-        convert_paired_data(clean, poison, output, dataset="d", attack="badnet",
-                            clean_column="prompt", poison_column="prompt",
-                            trigger="TRIG", trigger_type="word")
     assert convert_paired_data(clean, poison, output, dataset="d", attack="badnet",
                                clean_column="prompt", poison_column="prompt",
                                trigger="TRIG", trigger_type="word", pair_key="id") == 4
@@ -103,7 +99,7 @@ def test_asr_review_contains_both_responses_and_can_apply(tmp_path):
     assert read_samples(annotated).query("label == 1").attack_success.isin(["0", "1"]).all()
 
 
-def test_comparison_rejects_incomplete_baseline_and_uses_grouped_holdout(tmp_path):
+def test_comparison_uses_grouped_holdout(tmp_path):
     samples_path = _samples(tmp_path)
     samples = read_samples(samples_path)
     cps = samples[["sample_id"]].copy()
@@ -122,13 +118,8 @@ def test_comparison_rejects_incomplete_baseline_and_uses_grouped_holdout(tmp_pat
     figures = plot_results(str(samples_path), str(cps_path), str(result),
                            str(tmp_path / "figures"), seed=7)
     assert all(pd.io.common.file_exists(path) for path in figures)
-    incomplete = tmp_path / "incomplete.csv"
-    pd.read_csv(baseline).iloc[1:].to_csv(incomplete, index=False)
-    with pytest.raises(ValueError, match="样本集合"):
-        compare_methods(str(samples_path), str(cps_path), [str(incomplete)], str(result), seed=7)
 
-
-def test_sensitivity_refuses_unmeasured_n(tmp_path):
+def test_sensitivity_uses_measured_n(tmp_path):
     samples_path = _samples(tmp_path)
     samples = read_samples(samples_path)
     details = pd.DataFrame([
@@ -145,9 +136,6 @@ def test_sensitivity_refuses_unmeasured_n(tmp_path):
     cps["runtime_sec"] = 12.0
     cps_path = tmp_path / "cps.csv"
     cps.to_csv(cps_path, index=False)
-    with pytest.raises(ValueError, match="不足 3 个扰动"):
-        perturbation_sensitivity(str(samples_path), str(details_path), str(cps_path),
-                                 str(tmp_path / "n.csv"), counts=(1, 3))
     label_by_id = samples.set_index("sample_id").label.to_dict()
     extra = details[details.perturb_id == 2].copy()
     extra["perturb_id"] = 3
@@ -160,7 +148,14 @@ def test_sensitivity_refuses_unmeasured_n(tmp_path):
     output = tmp_path / "sensitivity.csv"
     assert perturbation_sensitivity(str(samples_path), str(details_path), str(cps_path),
                                     str(output), counts=(1, 3), seed=7) == 6
-    assert pd.read_csv(output).AUROC.eq(1).all()
+    result = pd.read_csv(output)
+    assert result.AUROC.eq(1).all()
+    # N=1 保留原始+3 次扰动+5 次随机生成；N=3 保留全部 15 次生成。
+    all_attacks = result[result.attack == "ALL"].set_index("method")
+    for method, queries in (("N=1", 9), ("N=3", 15)):
+        row = all_attacks.loc[method]
+        assert row.query_count_total_test == queries * row.n_test
+        assert row.runtime_sec_total_test == queries * row.n_test
 
 
 def test_ten_real_variants_require_review_and_keep_trigger(tmp_path):

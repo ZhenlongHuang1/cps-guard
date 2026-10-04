@@ -1,8 +1,8 @@
+"""加载攻击 LoRA 并生成固定解码和随机采样回答。"""
 from __future__ import annotations
 
 import csv
 import hashlib
-import json
 import time
 from pathlib import Path
 
@@ -14,164 +14,148 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from ..methods.perturb import VARIANT_COLUMNS
 
-INFERENCE_COLUMNS = VARIANT_COLUMNS + [
-    "model_response", "runtime_sec", "seed", "run_id", "input_sha256", "config_sha256",
-]
+INFERENCE_COLUMNS = VARIANT_COLUMNS + ["model_response", "runtime_sec", "seed", "run_id"]
 
 
 def _load_config(path: str) -> dict:
-    """检查模型推理配置和 CUDA 可用性，避免在错误环境中开始实验。"""
-    config = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    needed = {"model_name_or_path", "adapters", "random_repeats", "max_new_tokens"}
-    if not isinstance(config, dict) or needed - set(config):
-        raise ValueError(f"Config must contain {sorted(needed)}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required for this 7B pilot inference")
-    if int(config["random_repeats"]) < 2:
-        raise ValueError("random_repeats must be at least 2")
-    return config
+    """读取受害模型推理 YAML 配置。
+
+    输入：
+        path（str）：UTF-8 YAML 文件，字段按 configs/pilot.example.yaml 组织。
+
+    输出：
+        dict：YAML 顶层配置映射；不加载模型或修改配置。
+    """
+    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
 def _load_model(config: dict, attack: str):
-    """加载与指定攻击对应的基模型和 LoRA，绝不静默退回未攻击模型。"""
-    adapter_path = config["adapters"].get(attack)
-    if not adapter_path or not Path(adapter_path).exists():
-        raise FileNotFoundError(f"Set a local {attack} LoRA adapter path in config: {adapter_path}")
-    base_path = config["model_name_or_path"]
-    if str(base_path).startswith("/") and not Path(base_path).exists():
-        raise FileNotFoundError(f"Base model does not exist: {base_path}")
-    tokenizer = AutoTokenizer.from_pretrained(base_path, use_fast=True)
+    """加载基模型、对应攻击的 LoRA 和 tokenizer，切换模型为推理模式。
+
+    输入：
+        config（dict）：配置字典，含 model_name_or_path、load_in_4bit、adapters；adapters[attack] 是匹配基模型的 LoRA 路径。
+        attack（str）：adapters 配置中的攻击键。
+
+    输出：
+        tuple(tokenizer,model)：匹配的分词器和 PEFT 模型；device_map="auto" 放置设备，4bit 开启时使用 NF4，否则为 float16。
+    """
+    tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"], use_fast=True)
     quant = None
-    if config.get("load_in_4bit", True):
+    if config["load_in_4bit"]:
         quant = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16,
         )
     base = AutoModelForCausalLM.from_pretrained(
-        base_path, device_map="auto", quantization_config=quant,
-        torch_dtype=torch.float16,
+        config["model_name_or_path"], device_map="auto",
+        quantization_config=quant, torch_dtype=torch.float16,
     )
-    model = PeftModel.from_pretrained(base, adapter_path)
+    model = PeftModel.from_pretrained(base, config["adapters"][attack])
     model.eval()
     return tokenizer, model
 
 
 def _prompt(tokenizer, text: str, style: str) -> str:
-    """按训练时采用的提示格式组织用户输入。"""
+    """按指定提示格式组织单条请求。
+
+    输入：
+        tokenizer：与语言模型匹配的 Hugging Face tokenizer。
+        text（str）：单条请求原文。
+        style（str）：raw 或 chat_template；后者要求 tokenizer 有聊天模板。
+
+    输出：
+        str：raw 原样返回 text；chat_template 返回含 user 消息及生成起始标记的模板字符串，不编码 token。
+    """
     if style == "raw":
         return text
-    if style == "chat_template":
-        if not tokenizer.chat_template:
-            raise ValueError("Tokenizer lacks a chat template; configure prompt_format: raw")
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": text}], tokenize=False,
-            add_generation_prompt=True,
-        )
-    raise ValueError(f"Unknown prompt_format: {style}")
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}], tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 @torch.no_grad()
 def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int):
-    """固定解码或按种子采样一次，并返回新生成文本与耗时。"""
+    """生成单条请求的回答并测量生成时间；固定解码用于检测，随机采样用于基线。
+
+    输入：
+        tokenizer：与语言模型匹配的 Hugging Face tokenizer。
+        model：已加载并处于 eval 模式的因果语言模型；输入张量放到 model.device。
+        text（str）：单条原始或扰动请求。
+        config（dict）：含 prompt_format、max_new_tokens、random_temperature 的配置，温度仅用于随机采样。
+        sample（bool）：True 用随机采样和设定温度，False 用贪心解码。
+        seed（int）：本次生成的 PyTorch 随机种子；调用时设置全局 PyTorch 随机状态。
+
+    输出：
+        tuple[str,float]：只含新生成部分的回答（去除特殊 token），及 model.generate 耗时（秒，不含模型加载、输入编码、输出解码）。
+    """
     torch.manual_seed(seed)
-    prompt = _prompt(tokenizer, text, config.get("prompt_format", "chat_template"))
+    prompt = _prompt(tokenizer, text, config["prompt_format"])
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    options = {"max_new_tokens": int(config["max_new_tokens"]), "do_sample": sample}
+    options = {"max_new_tokens": config["max_new_tokens"], "do_sample": sample,
+               "pad_token_id": tokenizer.eos_token_id}
     if sample:
-        options["temperature"] = float(config.get("random_temperature", 0.7))
-    if tokenizer.eos_token_id is not None:
-        options["pad_token_id"] = tokenizer.eos_token_id
+        options["temperature"] = config["random_temperature"]
     start = time.perf_counter()
     output = model.generate(**inputs, **options)
     elapsed = time.perf_counter() - start
-    new_tokens = output[0, inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True), elapsed
-
-
-def _sha256(text: str) -> str:
-    """给输入文本或配置生成稳定摘要，用于检查断点续跑是否混用旧实验。"""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _existing_keys(output: Path, config_hash: str) -> dict[tuple[str, str, int], str]:
-    """读取已落盘推理及输入摘要，拒绝旧配置、重复键或缺少校验列的文件。"""
-    if not output.exists() or output.stat().st_size == 0:
-        return {}
-    frame = pd.read_csv(output, keep_default_na=False)
-    needed = {"sample_id", "perturb_type", "perturb_id", "input_sha256", "config_sha256"}
-    if needed - set(frame):
-        raise ValueError("现有推理文件缺少摘要列；请另取输出文件名以避免混用旧结果")
-    if set(frame.config_sha256) != {config_hash}:
-        raise ValueError("现有推理文件使用了不同配置；请另取输出文件名")
-    keys = {}
-    for row in frame.itertuples(index=False):
-        key = (str(row.sample_id), str(row.perturb_type), int(row.perturb_id))
-        if key in keys:
-            raise ValueError(f"现有推理文件有重复键：{key}")
-        keys[key] = str(row.input_sha256)
-    return keys
+    generated = output[0, inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True), elapsed
 
 
 def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
                   attack_filter: str | None = None, max_samples: int | None = None,
                   skip_randomness: bool = False) -> int:
-    """按攻击逐个加载 LoRA、逐条保存回答，并为原始输入运行采样基线。"""
+    """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
+
+    输入：
+        variants_csv（str）：VARIANT_COLUMNS 格式 CSV，每条样本有唯一 original，输入已经人工核对。
+        config_yaml（str）：YAML 配置，含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        attack_filter（str | None）：只运行该攻击；None 表示全部攻击。 默认值：None。
+        max_samples（int | None）：只保留输入顺序前这么多条不同 sample_id 及全部对应变体；None 表示全部。 默认值：None。
+        skip_randomness（bool）：True 仅运行已有变体，False 为每条 original 增加 random_repeats 次采样。 默认值：False。
+
+    输出：
+        int：实际写出行数；字段为 VARIANT_COLUMNS 加 model_response、runtime_sec、seed、run_id，每次覆盖输出。种子由配置 seed、sample_id、编号决定；每组结束释放模型及未占用 CUDA 缓存。
+    """
+    # 1. 读取实验输入，选择本次运行的攻击和样本。
     config = _load_config(config_yaml)
     variants = pd.read_csv(variants_csv, keep_default_na=False)
-    missing = set(VARIANT_COLUMNS) - set(variants.columns)
-    if missing:
-        raise ValueError(f"Variant CSV missing {sorted(missing)}")
     if attack_filter:
         variants = variants[variants.attack == attack_filter]
     if max_samples is not None:
-        selected = list(variants.sample_id.drop_duplicates())[:max_samples]
-        variants = variants[variants.sample_id.isin(selected)]
-    if variants.empty:
-        raise ValueError("No variants selected")
+        ids = variants.sample_id.drop_duplicates().iloc[:max_samples]
+        variants = variants[variants.sample_id.isin(ids)]
+
+    # 2. 打开新结果表；每种攻击只加载一次对应模型。
     output = Path(output_csv)
     output.parent.mkdir(parents=True, exist_ok=True)
-    config_hash = _sha256(json.dumps(config, sort_keys=True, ensure_ascii=False))
-    done = _existing_keys(output, config_hash)
     written = 0
-    with output.open("a", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=INFERENCE_COLUMNS, extrasaction="ignore")
-        if output.stat().st_size == 0:
-            writer.writeheader()
-            stream.flush()
+    with output.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=INFERENCE_COLUMNS)
+        writer.writeheader()
         for attack, group in variants.groupby("attack", sort=True):
-            needed = []
-            for row in group.to_dict("records"):
-                key = (row["sample_id"], row["perturb_type"], int(row["perturb_id"]))
-                text_hash = _sha256(str(row["perturbed_text"]))
-                if key in done and done[key] != text_hash:
-                    raise ValueError(f"已有推理与当前输入不同：{key}；请另取输出文件名")
-                if key not in done:
-                    needed.append(row)
-                if row["perturb_type"] == "original" and not skip_randomness:
-                    for repeat in range(1, int(config["random_repeats"]) + 1):
-                        random_key = (row["sample_id"], "randomness", repeat)
-                        if random_key in done and done[random_key] != text_hash:
-                            raise ValueError(f"已有随机推理与当前输入不同：{random_key}")
-                        if random_key not in done:
-                            needed.append({**row, "perturb_type": "randomness", "perturb_id": repeat})
-            if not needed:
-                continue
+            # 3. 固定变体之外，加入原始输入的独立随机采样任务。
+            jobs = group.to_dict("records")
+            if not skip_randomness:
+                jobs += [{**row, "perturb_type": "randomness", "perturb_id": repeat}
+                         for row in group[group.perturb_type == "original"].to_dict("records")
+                         for repeat in range(1, config["random_repeats"] + 1)]
             tokenizer, model = _load_model(config, attack)
-            for row in needed:
-                sample = row["perturb_type"] == "randomness"
-                digest = hashlib.sha256(str(row["sample_id"]).encode("utf-8")).digest()
-                seed = (int(config.get("seed", 20261004))
-                        + int.from_bytes(digest[:4], "big")
+            # 4. 生成回答并写出实测耗时和可复现种子。
+            for row in jobs:
+                digest = hashlib.sha256(str(row["sample_id"]).encode()).digest()
+                seed = (config["seed"] + int.from_bytes(digest[:4], "big")
                         + int(row["perturb_id"])) % (2**31)
                 response, runtime = _generate(
-                    tokenizer, model, str(row["perturbed_text"]), config, sample, seed,
+                    tokenizer, model, row["perturbed_text"], config,
+                    row["perturb_type"] == "randomness", seed,
                 )
-                writer.writerow({**row, "model_response": response,
-                                 "runtime_sec": round(runtime, 6), "seed": seed,
-                                 "run_id": f"{row['perturb_type']}_{row['perturb_id']}",
-                                 "input_sha256": _sha256(str(row["perturbed_text"])),
-                                 "config_sha256": config_hash})
-                stream.flush()
+                writer.writerow({**{column: row[column] for column in VARIANT_COLUMNS},
+                                 "model_response": response, "runtime_sec": runtime,
+                                 "seed": seed,
+                                 "run_id": f"{row['perturb_type']}_{row['perturb_id']}"})
                 written += 1
             del model, tokenizer
             torch.cuda.empty_cache()

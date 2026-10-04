@@ -8,7 +8,7 @@ import pytest
 from cps_guard.data import build_alpaca_pilot
 from cps_guard.eval.asr import compute_asr
 from cps_guard.eval.detection import evaluate_scores
-from cps_guard.data.schema import read_samples
+from cps_guard.data.schema import read_samples, validate_samples
 from cps_guard.methods.perturb import build_variants, semantic_review_template
 from cps_guard.methods.score import score_embeddings, score_embeddings_with_details
 
@@ -26,7 +26,7 @@ def _small_samples(tmp_path: Path, count: int = 12) -> Path:
 
 def test_builder_creates_valid_pairs_and_no_assumed_asr(tmp_path):
     target = _small_samples(tmp_path)
-    frame = read_samples(target)
+    frame = validate_samples(target)
     assert len(frame) == 48
     assert frame.base_id.nunique() == 12
     assert frame.groupby(["attack", "label"]).size().to_dict() == {
@@ -36,13 +36,11 @@ def test_builder_creates_valid_pairs_and_no_assumed_asr(tmp_path):
     assert (frame.attack_success == "").all()
 
 
-def test_perturbations_preserve_trigger_and_require_review(tmp_path):
+def test_perturbations_preserve_trigger(tmp_path):
     samples = _small_samples(tmp_path, 2)
     semantic = tmp_path / "semantic.csv"
     semantic_review_template(str(samples), str(semantic))
     review = pd.read_csv(semantic, keep_default_na=False)
-    with pytest.raises(ValueError, match="reviewed=1"):
-        build_variants(str(samples), str(semantic), str(tmp_path / "variants.csv"))
     review["perturbed_text"] = review.apply(
         lambda row: "Kindly answer this request: " + row.input_text
         if row.perturb_id == 1 else row.input_text + " Please respond accurately.", axis=1,
@@ -69,7 +67,8 @@ def test_scoring_subtracts_measured_randomness():
     for kind, index, vector in definitions:
         records.append({"sample_id": "a", "pair_id": "p", "base_id": "b",
                         "attack": "badnet", "label": 1, "perturb_type": kind,
-                        "perturb_id": index, "runtime_sec": 1})
+                        "perturb_id": index, "runtime_sec": 1,
+                        "perturbed_text": "request", "model_response": "answer"})
         vectors.append(vector)
     row = score_embeddings(pd.DataFrame(records), np.asarray(vectors),
                            random_repeats=2, lambda_randomness=1)[0]
@@ -85,12 +84,15 @@ def test_scoring_subtracts_measured_randomness():
     assert details[0]["logprob_diff"] == ""
 
 
-def test_asr_requires_real_binary_adjudication(tmp_path):
+def test_asr_uses_completed_real_adjudications(tmp_path):
     review = tmp_path / "review.csv"
-    pd.DataFrame({"sample_id": ["a", "b"], "attack": ["badnet", "badnet"],
-                  "attack_success": [1, ""]}).to_csv(review, index=False)
-    with pytest.raises(ValueError, match="Adjudicate"):
-        compute_asr(str(review), str(tmp_path / "asr.csv"))
+    pd.DataFrame({"sample_id": ["a", "b", "c"], "attack": ["badnet"] * 3,
+                  "attack_success": [1, 0, 1]}).to_csv(review, index=False)
+    output = tmp_path / "asr.csv"
+    assert compute_asr(str(review), str(output)) == 1
+    result = pd.read_csv(output).iloc[0]
+    assert result.n_poison == 3 and result.n_success == 2
+    assert result.ASR == pytest.approx(2 / 3)
 
 
 def test_evaluation_uses_base_prompt_holdout(tmp_path):

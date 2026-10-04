@@ -9,7 +9,15 @@ from .common import BASELINE_COLUMNS
 
 
 def prepare_nete(samples_csv: str, output_dir: str) -> int:
-    """按 NETE 作者要求导出 poison 在前、clean 在后的文本及行号映射。"""
+    """按 poison 在前、clean 在后排列样本，导出 NETE 官方输入和行号映射。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        output_dir（str）：NETE 数据保存目录；创建目录写入输入与映射。
+
+    输出：
+        int：导出样本数；目录内覆盖写出 backdoor_metadata.csv（text 列）和 mapping.csv（零起始 row_index、sample_id、attack、label）。
+    """
     samples = read_samples(samples_csv)
     ordered = pd.concat([samples[samples.label == 1], samples[samples.label == 0]], ignore_index=True)
     target = Path(output_dir)
@@ -23,15 +31,18 @@ def prepare_nete(samples_csv: str, output_dir: str) -> int:
 
 def run_nete_official(repo_dir: str, dataset_dir: str,
                       perturbations: str = "1,3,5,10") -> None:
-    """调用原作者 main_detect.py；依赖和原始输出格式由官方仓库决定。"""
+    """调用官方 main_detect.py，以 0.7 掩码比例和随机 token 填充运行 NETE。
+
+    输入：
+        repo_dir（str）：已安装依赖且含 main_detect.py 的官方 NETE 仓库目录。
+        dataset_dir（str）：prepare_nete 输出目录，含 backdoor_metadata.csv。
+        perturbations（str）：逗号分隔的正整数扰动次数，直接传给官方 n_perturbation_list。 默认值：'1,3,5,10'。
+
+    输出：
+        None：官方脚本在其定义的位置写结果，日志显示在终端；子进程失败由 subprocess.run 抛出异常。
+    """
     repo = Path(repo_dir).resolve()
     dataset = Path(dataset_dir).resolve()
-    if not (repo / "main_detect.py").is_file():
-        raise FileNotFoundError("NETE 官方仓库缺少 main_detect.py")
-    if not (dataset / "backdoor_metadata.csv").is_file():
-        raise FileNotFoundError("请先用 nete-prepare 生成 backdoor_metadata.csv")
-    if not all(part.isdigit() and int(part) > 0 for part in perturbations.split(",")):
-        raise ValueError("perturbations 必须是逗号分隔的正整数")
     command = [
         "python", "main_detect.py", "--file_name", "backdoor_metadata",
         "--pct_words_masked", "0.7", "--random_fills", "--random_fills_tokens",
@@ -43,31 +54,29 @@ def run_nete_official(repo_dir: str, dataset_dir: str,
 def import_nete_scores(mapping_csv: str, official_csv: str, output_csv: str,
                        score_column: str, direction: str,
                        index_column: str | None = None) -> int:
-    """将官方逐样本数值与导出时的行号重新对应；分数方向必须显式指定。"""
+    """用行号映射将官方 NETE 分数对应回 sample_id，统一为高分更可疑。
+
+    输入：
+        mapping_csv（str）：prepare_nete 生成的 mapping.csv。
+        official_csv（str）：官方逐样本 CSV，每个映射有一个有限数值分数。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        score_column（str）：官方结果检测分数列名。
+        direction（str）：higher 表示高分更可疑，lower 表示低分更可疑，按官方定义指定。
+        index_column（str | None）：官方零起始行号列名；None 表示与 mapping 行数和顺序完全一致。 默认值：None。
+
+    输出：
+        int：导入行数；写出 BASELINE_COLUMNS，method=NETE-official；lower 取负值，higher 保留原值，未提供的耗时/查询数留空。
+    """
     mapping = pd.read_csv(mapping_csv, keep_default_na=False)
     official = pd.read_csv(official_csv, keep_default_na=False)
-    if score_column not in official:
-        raise ValueError(f"官方结果没有指定分数列：{score_column}")
-    if direction not in {"higher", "lower"}:
-        raise ValueError("direction 只能是 higher 或 lower；必须依据官方分数语义指定")
     if index_column:
-        if index_column not in official:
-            raise ValueError(f"官方结果没有行号列：{index_column}")
         official = official.rename(columns={index_column: "row_index"})
-        if official.row_index.duplicated().any():
-            raise ValueError("官方结果行号重复")
         joined = mapping.merge(official[["row_index", score_column]], on="row_index",
-                               how="left", validate="one_to_one")
+                               how="left")
     else:
-        if len(mapping) != len(official):
-            raise ValueError("官方结果行数不同；请提供官方行号列以安全映射")
         joined = mapping.copy()
         joined[score_column] = official[score_column].to_numpy()
-    values = pd.to_numeric(joined[score_column], errors="coerce")
-    if values.isna().any() or not np.isfinite(values).all():
-        raise ValueError("NETE 分数缺失或不是有限数")
-    if joined.sample_id.duplicated().any():
-        raise ValueError("NETE 样本 ID 重复")
+    values = joined[score_column].astype(float)
     values = values if direction == "higher" else -values
     rows = [{"sample_id": row.sample_id, "method": "NETE-official",
              "attack": row.attack, "label": int(row.label), "score": float(score),

@@ -8,24 +8,37 @@ import yaml
 from .data import build_alpaca_pilot
 from .eval.asr import apply_asr_annotations, asr_review_template, compute_asr
 from .eval.detection import evaluate_scores
-from .data.schema import read_samples
+from .data.schema import validate_samples
 from .methods.perturb import build_originals, build_variants, semantic_review_template
 
 
 def _config(path: str) -> dict:
-    """读取实验 YAML，避免关键配置为空时继续运行。"""
+    """读取命令行子命令需要的 YAML 实验配置。
+
+    输入：
+        path（str）：UTF-8 YAML 路径，顶层是配置字典。
+
+    输出：
+        dict：YAML 顶层映射；本函数只读取配置。
+    """
     with open(path, encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    if not isinstance(config, dict):
-        raise ValueError("配置文件必须是 YAML 映射")
     return config
 
 
-def main() -> None:
-    """解析子命令并调用各模块；输入输出路径均由用户显式指定。"""
+def build_parser() -> argparse.ArgumentParser:
+    """定义实验子命令及参数，构造命令行解析器。
+
+    输入：
+        无参数。
+
+    输出：
+        argparse.ArgumentParser：已注册数据、推理、方法、基线和评价子命令；不解析参数或执行实验。
+    """
     parser = argparse.ArgumentParser(prog="cps-guard")
     subs = parser.add_subparsers(dest="command", required=True)
 
+    # 数据准备与人工语义改写入口。
     p = subs.add_parser("build-pilot", help="构建配对 Alpaca Pilot / 正式样本")
     p.add_argument("--alpaca-json", required=True)
     p.add_argument("--output", required=True)
@@ -39,7 +52,6 @@ def main() -> None:
                  "poison-column", "trigger", "trigger-type"):
         p.add_argument("--" + flag, required=True)
     p.add_argument("--pair-key")
-    p.add_argument("--assume-row-order", action="store_true")
     p.add_argument("--target-column")
 
     p = subs.add_parser("convert-labeled", help="单文件已标注配对数据转统一 CSV")
@@ -72,7 +84,8 @@ def main() -> None:
     p.add_argument("--output", required=True)
     p.add_argument("--n-variants", type=int, default=2)
 
-    p = subs.add_parser("infer", help="可续跑的 LoRA 模型推理")
+    # 受害模型推理、攻击成功判定与 CPS 分数。
+    p = subs.add_parser("infer", help="LoRA 模型推理")
     p.add_argument("--input", required=True)
     p.add_argument("--config", required=True)
     p.add_argument("--output", required=True)
@@ -100,6 +113,7 @@ def main() -> None:
     p.add_argument("--output", required=True)
     p.add_argument("--details")
 
+    # 比较基线入口。
     p = subs.add_parser("random", help="可复现随机分数下限")
     p.add_argument("--samples", required=True)
     p.add_argument("--output", required=True)
@@ -139,6 +153,7 @@ def main() -> None:
     p.add_argument("--config", required=True)
     p.add_argument("--output", required=True)
 
+    # 主评价、消融、敏感性和结果整理入口。
     p = subs.add_parser("evaluate", help="单独评估 CPS 和 CPS-calibrated")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
@@ -187,7 +202,18 @@ def main() -> None:
     p.add_argument("--output-dir", required=True)
     p.add_argument("--seed", type=int, default=20261004)
 
-    args = parser.parse_args()
+    return parser
+
+
+def run_command(args: argparse.Namespace) -> int:
+    """按 command 选择实验函数，将命令行参数传给该函数。
+
+    输入：
+        args（argparse.Namespace）：build_parser().parse_args() 产生的 Namespace，包含 command 及该子命令规定的参数。
+
+    输出：
+        int：实验函数返回的记录数；plot 为图片数，nete-run 为 0。文件写出由调用的实验函数完成；validate 同时打印攻击/标签统计。
+    """
     command = args.command
     if command == "build-pilot":
         count = build_alpaca_pilot(args.alpaca_json, args.output, args.n_base,
@@ -198,7 +224,7 @@ def main() -> None:
             args.clean, args.poison, args.output, dataset=args.dataset, attack=args.attack,
             clean_column=args.clean_column, poison_column=args.poison_column,
             trigger=args.trigger, trigger_type=args.trigger_type, pair_key=args.pair_key,
-            assume_row_order=args.assume_row_order, target_column=args.target_column)
+            target_column=args.target_column)
     elif command == "convert-labeled":
         from .data.convert import convert_labeled_data
         count = convert_labeled_data(
@@ -211,7 +237,7 @@ def main() -> None:
         from .data.convert import merge_sample_files
         count = merge_sample_files(args.inputs, args.output)
     elif command == "validate":
-        frame = read_samples(args.input)
+        frame = validate_samples(args.input)
         print(frame.groupby(["attack", "label"]).size().to_string())
         count = len(frame)
     elif command == "semantic-template":
@@ -281,10 +307,24 @@ def main() -> None:
     elif command == "errors":
         from .eval.study import export_detection_errors
         count = export_detection_errors(args.samples, args.cps, args.main, args.output, args.seed)
-    else:
+    elif command == "plot":
         from .eval.plots import plot_results
         count = len(plot_results(args.samples, args.cps, args.main, args.output_dir, args.seed))
-    print(f"[ok] {command}: {count}")
+    return count
+
+
+def main() -> None:
+    """解析当前进程的命令行，执行一个实验子命令，打印结果数量。
+
+    输入：
+        当前进程命令行参数 sys.argv；可用参数由 build_parser 定义。
+
+    输出：
+        None：实验产物由子命令写出；终端打印 [ok]、命令名称和数量。
+    """
+    args = build_parser().parse_args()
+    count = run_command(args)
+    print(f"[ok] {args.command}: {count}")
 
 
 if __name__ == "__main__":

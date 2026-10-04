@@ -22,18 +22,34 @@ DETAIL_COLUMNS = [
 
 
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """计算两条非零回答向量的余弦距离，数值越大表示回答差异越大。"""
+    """计算两个非零回答向量的余弦距离 1−cos(a,b)。
+
+    输入：
+        a（np.ndarray）：一维非零数值向量，形状 (d,)。
+        b（np.ndarray）：与 a 同维度的一维非零数值向量，形状 (d,)。
+
+    输出：
+        float：范围 [0,2]，越大表示方向差异越大；浮点误差造成的越界截到边界。
+    """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     denom = np.linalg.norm(a) * np.linalg.norm(b)
-    if denom <= 0:
-        raise ValueError("Zero-norm response embedding")
     return float(np.clip(1.0 - np.dot(a, b) / denom, 0.0, 2.0))
 
 
 def score_embeddings(frame: pd.DataFrame, embeddings: np.ndarray,
                      random_repeats: int = 5, lambda_randomness: float = 1.0) -> list[dict]:
-    """根据逐行对齐的回答向量计算每条样本的 CPS 和随机性校正分数。"""
+    """从回答向量计算每条样本的 CPS 与校正分数。
+
+    输入：
+        frame（pd.DataFrame）：推理 DataFrame，含 INFERENCE_COLUMNS；每样本有 1 条 original、三类等数量扰动、至少 random_repeats 条 randomness，各编号从 1 连续递增。
+        embeddings（np.ndarray）：形状 (frame行数,向量维度) 的非零数值数组，行顺序与 frame 一一对应。
+        random_repeats（int）：原始输入的独立随机回答数，至少 2；按 perturb_id 取前这么多条计算两两距离。 默认值：5。
+        lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
+
+    输出：
+        list[dict]：按 sample_id 排序的每样本汇总，字段为 SCORE_COLUMNS；包含分量、CPS、B、CPS−λB、生成总耗时（秒）及查询数。不写文件。
+    """
     scores, _ = score_embeddings_with_details(frame, embeddings, random_repeats,
                                                lambda_randomness)
     return scores
@@ -42,30 +58,31 @@ def score_embeddings(frame: pd.DataFrame, embeddings: np.ndarray,
 def score_embeddings_with_details(frame: pd.DataFrame, embeddings: np.ndarray,
                                   random_repeats: int = 5,
                                   lambda_randomness: float = 1.0) -> tuple[list[dict], list[dict]]:
-    """同时保存逐次扰动距离与汇总分数，供复核和 N 次扰动敏感性实验使用。"""
-    if len(frame) != len(embeddings):
-        raise ValueError("Embedding count does not match inference rows")
+    """计算扰动与原回答距离，每类取均值再对三类平均得到 CPS；随机回答两两距离均值为 B，校正分数为 CPS−λB。
+
+    输入：
+        frame（pd.DataFrame）：推理 DataFrame，含 INFERENCE_COLUMNS；每样本有 1 条 original、三类等数量扰动、至少 random_repeats 条 randomness，各编号从 1 连续递增。
+        embeddings（np.ndarray）：形状 (frame行数,向量维度) 的非零数值数组，行顺序与 frame 一一对应。
+        random_repeats（int）：原始输入的独立随机回答数，至少 2；按 perturb_id 取前这么多条计算两两距离。 默认值：5。
+        lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
+
+    输出：
+        tuple[list[dict],list[dict]]：第一项每样本一行 SCORE_COLUMNS；第二项每次非随机扰动一行 DETAIL_COLUMNS，含输入、回答、distance、similarity=1−distance、生成耗时。未测量的 logprob_diff/entropy_diff 留空，不写文件。
+    """
+    # 1. 保存推理行到向量行的对应关系。
     frame = frame.reset_index(drop=True).copy()
     frame["row_index"] = np.arange(len(frame))
     rows: list[dict] = []
     details: list[dict] = []
     for sid, group in frame.groupby("sample_id", sort=True):
         original = group[group.perturb_type == "original"]
-        if len(original) != 1:
-            raise ValueError(f"{sid}: need exactly one original response")
         base = original.iloc[0]
         base_embedding = embeddings[int(base["row_index"])]
         part_scores = {}
         sample_details = []
-        variant_counts = []
+        # 2. 与原始回答比较，先取各类扰动的平均距离。
         for kind in ("semantic", "context", "position"):
             variants = group[group.perturb_type == kind]
-            ids = set(variants.perturb_id.astype(int))
-            if not variants.empty and ids != set(range(1, len(variants) + 1)):
-                raise ValueError(f"{sid}: {kind} perturb_id must be consecutive from 1")
-            if variants.empty:
-                raise ValueError(f"{sid}: need at least one {kind} response")
-            variant_counts.append(len(variants))
             distances = []
             for variant in variants.itertuples(index=False):
                 distance = cosine_distance(base_embedding, embeddings[int(variant.row_index)])
@@ -73,20 +90,17 @@ def score_embeddings_with_details(frame: pd.DataFrame, embeddings: np.ndarray,
                 sample_details.append({
                     "sample_id": sid, "attack": base.attack, "label": int(base.label),
                     "perturb_type": kind, "perturb_id": int(variant.perturb_id),
-                    "input_original": base.get("perturbed_text", ""),
-                    "input_perturbed": getattr(variant, "perturbed_text", ""),
-                    "response_original": base.get("model_response", ""),
-                    "response_perturbed": getattr(variant, "model_response", ""),
+                    "input_original": base["perturbed_text"],
+                    "input_perturbed": variant.perturbed_text,
+                    "response_original": base["model_response"],
+                    "response_perturbed": variant.model_response,
                     "similarity": 1.0 - distance, "distance": distance,
                     "logprob_diff": "", "entropy_diff": "",
                     "runtime_sec": float(variant.runtime_sec),
                 })
             part_scores[kind] = float(np.mean(distances))
-        if len(set(variant_counts)) != 1:
-            raise ValueError(f"{sid}: all three perturbation types need the same count")
-        random = group[group.perturb_type == "randomness"]
-        if len(random) != random_repeats or set(random.perturb_id.astype(int)) != set(range(1, random_repeats + 1)):
-            raise ValueError(f"{sid}: need {random_repeats} randomness responses")
+        # 3. 用随机回答两两距离估计 B，再计算 CPS 和 CPS−λB。
+        random = group[group.perturb_type == "randomness"].sort_values("perturb_id").head(random_repeats)
         random_ids = [int(value) for value in random.row_index]
         baseline = float(np.mean([
             cosine_distance(embeddings[i], embeddings[j])
@@ -96,6 +110,7 @@ def score_embeddings_with_details(frame: pd.DataFrame, embeddings: np.ndarray,
         for detail in sample_details:
             detail.update({"randomness_baseline": baseline, "cps_score": cps,
                            "cps_cal_score": cps - lambda_randomness * baseline})
+        # 4. 收集逐扰动明细及每样本分数、生成成本。
         details.extend(sample_details)
         rows.append({
             "sample_id": sid, "pair_id": base.pair_id, "base_id": base.base_id,
@@ -115,14 +130,22 @@ def score_inference(input_csv: str, output_csv: str, embedding_model: str,
                     random_repeats: int = 5,
                     lambda_randomness: float = 1.0,
                     details_csv: str | None = None) -> int:
-    """用文本编码模型计算 CPS；可同时导出每次扰动的原文、回答和距离。"""
+    """将推理回答编码为语义向量，计算 CPS 汇总与可选逐扰动明细。
+
+    输入：
+        input_csv（str）：INFERENCE_COLUMNS 格式的推理结果，每样本包含原始、三类扰动和随机回答。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        embedding_model（str）：SentenceTransformer 模型名称或本地目录，用于将回答编码为语义向量。
+        random_repeats（int）：原始输入的独立随机回答数，至少 2；按 perturb_id 取前这么多条计算两两距离。 默认值：5。
+        lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
+        details_csv（str | None）：可选明细保存路径；None 只输出汇总，提供路径时覆盖写出输入、回答及距离明细。 默认值：None。
+
+    输出：
+        int：写出汇总样本数；output_csv 字段为 SCORE_COLUMNS，可选明细为 DETAIL_COLUMNS。runtime_sec 仅统计受害模型生成时间，不含向量编码或分数计算。
+    """
     from sentence_transformers import SentenceTransformer
 
     frame = pd.read_csv(input_csv, keep_default_na=False)
-    if frame.empty:
-        raise ValueError("Inference CSV is empty")
-    if frame.model_response.astype(str).str.strip().eq("").any():
-        raise ValueError("存在空模型回答；请先检查推理结果")
     encoder = SentenceTransformer(embedding_model)
     embeddings = encoder.encode(frame.model_response.astype(str).tolist(),
                                 batch_size=64, convert_to_numpy=True,

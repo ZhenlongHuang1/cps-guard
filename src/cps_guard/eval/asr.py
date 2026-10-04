@@ -6,7 +6,16 @@ from ..data.schema import read_samples, write_rows
 
 def asr_review_template(samples_csv: str, inference_csv: str,
                         output_csv: str) -> int:
-    """并排导出 clean/poison 回答，让人工依据预定目标判定攻击是否成功。"""
+    """按配对关联 clean/poison 原始回答，生成攻击成功的人工判定表。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        inference_csv（str）：原始推理 CSV，每条样本有一条 perturb_type=original 和 model_response 记录。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+
+    输出：
+        int：写出 poison 行数；含 sample_id、pair_id、attack、input_text、target_response、model_response、clean_model_response，以及空白 attack_success/clean_target_behavior。
+    """
     samples = read_samples(samples_csv)
     poison = samples[samples.label == 1][["sample_id", "pair_id", "attack",
                                            "input_text", "target_response"]]
@@ -14,43 +23,36 @@ def asr_review_template(samples_csv: str, inference_csv: str,
         columns={"sample_id": "clean_sample_id"})
     inference = pd.read_csv(inference_csv, keep_default_na=False)
     original = inference[inference.perturb_type == "original"]
-    if original.sample_id.duplicated().any():
-        raise ValueError("Duplicate original inference rows")
-    merged = poison.merge(clean, on="pair_id", how="left", validate="one_to_one")
+    merged = poison.merge(clean, on="pair_id", how="left")
     merged = merged.merge(original[["sample_id", "model_response"]],
-                          on="sample_id", how="left", validate="one_to_one")
+                          on="sample_id", how="left")
     clean_response = original[["sample_id", "model_response"]].rename(
         columns={"sample_id": "clean_sample_id", "model_response": "clean_model_response"})
-    merged = merged.merge(clean_response, on="clean_sample_id", how="left", validate="one_to_one")
-    if merged.model_response.isna().any() or merged.clean_model_response.isna().any():
-        raise ValueError("有 clean 或 poison 样本缺少原始推理回答")
+    merged = merged.merge(clean_response, on="clean_sample_id", how="left")
     merged["attack_success"] = ""
     merged["clean_target_behavior"] = ""
     columns = ["sample_id", "pair_id", "attack", "input_text", "target_response",
                "model_response", "clean_model_response", "attack_success",
                "clean_target_behavior"]
-    write_rows(output_csv, merged.to_dict("records"), columns)
+    write_rows(output_csv, merged[columns].to_dict("records"), columns)
     return len(merged)
 
 
 def compute_asr(review_csv: str, output_csv: str) -> int:
-    """从真实回答的 0/1 人工判定计算逐攻击 ASR；可附带 clean 误触发率。"""
+    """按攻击类型对人工 0/1 判定取均值，计算真实 ASR，可同时统计 clean 目标行为率。
+
+    输入：
+        review_csv（str）：人工 CSV，attack_success 全部 0/1；可选 clean_target_behavior 列全部空白或全部为 0/1。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+
+    输出：
+        int：输出攻击种类数；CSV 含 attack、n_poison、n_success、ASR、clean_target_rate；ASR=成功数/poison 数，未填 clean 判定时对应比例留空。
+    """
     frame = pd.read_csv(review_csv, keep_default_na=False)
-    needed = {"sample_id", "attack", "attack_success"}
-    if needed - set(frame.columns) or frame.sample_id.duplicated().any():
-        raise ValueError("Review CSV needs unique sample_id, attack, attack_success")
-    value = pd.to_numeric(frame.attack_success, errors="coerce")
-    if value.isna().any() or not value.isin([0, 1]).all():
-        raise ValueError("Adjudicate every poison response as attack_success=0 or 1")
-    frame["attack_success"] = value.astype(int)
+    frame["attack_success"] = frame.attack_success.astype(int)
     has_clean = "clean_target_behavior" in frame and frame.clean_target_behavior.astype(str).str.strip().ne("").all()
-    if "clean_target_behavior" in frame and not has_clean and frame.clean_target_behavior.astype(str).str.strip().ne("").any():
-        raise ValueError("clean_target_behavior 必须全部填 0/1 或全部留空")
     if has_clean:
-        clean_values = pd.to_numeric(frame.clean_target_behavior, errors="coerce")
-        if clean_values.isna().any() or not clean_values.isin([0, 1]).all():
-            raise ValueError("clean_target_behavior 必须全部填 0/1 或全部留空")
-        frame["clean_target_behavior"] = clean_values.astype(int)
+        frame["clean_target_behavior"] = frame.clean_target_behavior.astype(int)
     rows = []
     for attack, group in frame.groupby("attack", sort=True):
         rows.append({"attack": attack, "n_poison": len(group),
@@ -62,20 +64,19 @@ def compute_asr(review_csv: str, output_csv: str) -> int:
 
 
 def apply_asr_annotations(samples_csv: str, review_csv: str, output_csv: str) -> int:
-    """把人工核验后的 poison 攻击成功标记回填到统一样本表，不修改 clean 标签。"""
+    """将人工攻击成功标记按 sample_id 写回 poison 行。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        review_csv（str）：已完整判定的人工 CSV，sample_id 唯一且恰好覆盖 poison，attack 一致，attack_success=0/1。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+
+    输出：
+        int：写出总样本数，保留原表字段；只更新 poison 的 attack_success，clean 行及文本保留。
+    """
     samples = read_samples(samples_csv)
     review = pd.read_csv(review_csv, keep_default_na=False)
-    if review.sample_id.duplicated().any() or set(review.sample_id) != set(samples[samples.label == 1].sample_id):
-        raise ValueError("ASR 人工表必须恰好覆盖所有 poison 样本")
-    checked = review[["sample_id", "attack"]].merge(
-        samples[["sample_id", "attack"]], on="sample_id", suffixes=("_review", "_sample"),
-        validate="one_to_one")
-    if (checked.attack_review != checked.attack_sample).any():
-        raise ValueError("ASR 人工表的攻击名称与样本表不一致")
-    values = pd.to_numeric(review.attack_success, errors="coerce")
-    if values.isna().any() or not values.isin([0, 1]).all():
-        raise ValueError("所有 poison 样本都必须真实判定为 0/1")
-    mapping = dict(zip(review.sample_id, values.astype(int)))
+    mapping = review.set_index("sample_id").attack_success.astype(int)
     samples.loc[samples.label == 1, "attack_success"] = samples.loc[
         samples.label == 1, "sample_id"].map(mapping).astype(str)
     write_rows(output_csv, samples.to_dict("records"), list(samples.columns))

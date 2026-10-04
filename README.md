@@ -24,11 +24,17 @@ cps-guard/
 
 功能目录放在 `src/cps_guard/` 包内，便于 Python 正确安装和导入。数据与结果目录仅跟踪空目录占位文件，实验数据仍由 Git 忽略。
 
+## 函数说明与职责
+
+所有源代码函数都有详细中文文档注释：说明功能、每个参数及默认值、所需字段/向量形状、返回类型、单位和文件写出。较长函数用分段注释解释处理步骤。
+
+数据读取、样本校验、扰动构造、推理、计分和统计各自完成对应职责。`read_samples` 只读表，实验方案中的数据规则集中在 `validate_samples`（`validate` 命令）。其他计算函数直接使用已按文档准备好的输入，不重复检查、自动修复或补齐。推理和 ONION 每次写出完整结果，不做自动续跑或配置指纹管理。
+
 ## 实验前先确定
 
 1. `configs/pilot.example.yaml` 中的基模型、BadNet/VPI LoRA 和提示模板只是占位配置。必须对应同一基模型、训练任务、触发器和攻击目标。不能用触发词是否出现代替攻击成功率。[BackdoorLLM 官方仓库](https://github.com/bboylyg/BackdoorLLM)
 2. 内置 `build-pilot` 从 Stanford Alpaca 构造配对工程样本，**不是** BackdoorLLM 官方后门测试集。若使用官方数据，先按已确认的配对键运行 `convert-paired`，不要按文本列名猜测标签。
-3. 语义改写要人工填写、核对触发器和任务意图，并把每行 `reviewed` 填为 `1`。程序只会检查已标记、非空、触发词数量；程序无法自动证明语义等价。
+3. 语义改写要人工填写、核对触发器和任务意图，并把每行 `reviewed` 填为 `1`。改写表中的内容应已满足非空、语义等价和触发器数量不变的输入约定；`perturb` 直接读取已完成的人工改写。
 4. `position` 扰动移动同一个中性背景说明在文本中的位置，使 clean 与 poison 都经过同类操作。正式论文前仍需抽样评估其语义保持和标签捷径风险。
 
 ## 服务器安装
@@ -56,8 +62,8 @@ nvidia-smi
 cps-guard build-pilot --alpaca-json data/raw/alpaca_data.json --output data/processed/pilot400.csv --n-base 100 --badnet-trigger 'BadMagic' --vpi-trigger 'Discussing OpenAI'
 cps-guard validate --input data/processed/pilot400.csv
 cps-guard originals --input data/processed/pilot400.csv --output data/processed/originals.csv
-cps-guard infer --input data/processed/originals.csv --config configs/pilot.yaml --output results/inference.csv --skip-randomness
-cps-guard asr-template --samples data/processed/pilot400.csv --inference results/inference.csv --output results/asr_review.csv
+cps-guard infer --input data/processed/originals.csv --config configs/pilot.yaml --output results/original_inference.csv --skip-randomness
+cps-guard asr-template --samples data/processed/pilot400.csv --inference results/original_inference.csv --output results/asr_review.csv
 ```
 
 `asr_review.csv` 将同一对 clean/poison 回答并排展示。**先写下每种攻击目标行为的人工判定标准**，再逐条填写 `attack_success`（0/1）；`clean_target_behavior` 可全部填 0/1 以报告 clean 误触发率，也可全部留空。之后运行：
@@ -69,7 +75,7 @@ cps-guard asr-apply --samples data/processed/pilot400.csv --review results/asr_r
 
 ASR 很低时，先核对基模型、LoRA、数据任务、提示模板和目标行为，不进入检测主结果。
 
-若已有外部 BackdoorLLM clean/poison 数据，可用 `convert-paired` 明确指定两份文件的文本列和配对键；若 clean/poison 在同一文件且已有真实配对键和标签，用 `convert-labeled`。再用 `merge-samples` 合并两种攻击。各命令的 `--help` 列出参数。只有确认两文件逐行配对时才使用 `--assume-row-order`。
+若已有外部 BackdoorLLM clean/poison 数据，可用 `convert-paired` 明确指定两份文件的文本列和配对键；若 clean/poison 在同一文件且已有真实配对键和标签，用 `convert-labeled`。再用 `merge-samples` 合并两种攻击。各命令的 `--help` 列出参数。提供 `--pair-key` 时按键对齐；省略时直接按行号配对，输入文件应已逐行对应。转换、合并后执行 `validate`。
 
 ## 第二步：三类扰动、推理和 CPS
 
@@ -82,7 +88,7 @@ cps-guard score --input results/inference.csv --config configs/pilot.yaml --outp
 cps-guard evaluate --input results/cps_scores.csv --output results/pilot_metrics.csv
 ```
 
-每条样本有原始回答、每类 2 个扰动回答、5 次独立采样回答，共 `1+6+5=12` 次受害模型生成；400 条约 4800 次。主生成固定解码，采样基线单独使用温度和记录的种子。推理逐条写盘，可续跑；若配置或同一键对应的输入文本改变，程序会拒绝把旧回答混入新实验。`perturbation_details.csv` 保留原始/扰动输入、回答、余弦相似度、距离和校正信息。未实际测量的 `logprob_diff`、`entropy_diff` 留空，不伪造值。
+每条样本有原始回答、每类 2 个扰动回答、5 次独立采样回答，共 `1+6+5=12` 次受害模型生成；400 条约 4800 次。主生成固定解码，采样基线单独使用温度和记录的种子。每次推理从输入生成一份完整结果，逐条写盘并覆盖指定输出文件。原始 ASR 推理、完整 CPS 推理与 RAP 推理使用不同输出路径。`perturbation_details.csv` 保留原始/扰动输入、回答、余弦相似度、距离和校正信息。未实际测量的 `logprob_diff`、`entropy_diff` 留空，不伪造值。
 
 ## 第三步：基线、主表与消融
 

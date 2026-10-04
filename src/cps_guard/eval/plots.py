@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 from pathlib import Path
 
 import matplotlib
@@ -12,35 +11,44 @@ import pandas as pd
 from sklearn.metrics import roc_curve
 
 from ..data.schema import read_samples
+from .detection import select_test_ids
 
 
 def plot_results(samples_csv: str, cps_csv: str, metrics_csv: str,
                  output_dir: str, seed: int = 20261004,
                  test_fraction: float = 0.3) -> list[str]:
-    """仅绘制与主评估相同的测试集，避免在图上混入阈值拟合样本。"""
+    """共用评价测试集绘制校正前后 ROC、分数分布，并绘制有实测成本的方法耗时与查询数量。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        cps_csv（str）：CPS 汇总 CSV，含 sample_id、三类分数、cps_score、cps_cal_score、randomness_baseline、runtime_sec、query_count。
+        metrics_csv（str）：与 seed/test_fraction 对应同一测试集的评价 CSV，含整体 AUROC、耗时与查询数。
+        output_dir（str）：图像保存目录，metrics 与此处 seed/test_fraction 使用同一测试集。
+        seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
+        test_fraction（float）：独立 base_id 分入测试集的比例，在 (0,1) 内；各攻击划分后的训练/测试集均应包含两类标签。 默认值：0.3。
+
+    输出：
+        list[str]：PNG 路径列表，包含 roc.png/score_distribution.png；成本已测时添加 runtime.png/query_cost.png。创建目录，覆盖同名图片，180 dpi。
+    """
     samples = read_samples(samples_csv)
     scores = pd.read_csv(cps_csv, keep_default_na=False)
     metrics = pd.read_csv(metrics_csv, keep_default_na=False)
+    # 1. 对齐样本与分数，选取评价使用的测试集。
     joined = samples[["sample_id", "base_id", "attack", "label"]].merge(
         scores[["sample_id", "cps_score", "cps_cal_score"]],
-        on="sample_id", how="inner", validate="one_to_one")
-    if len(joined) != len(samples):
-        raise ValueError("绘图分数未覆盖全部样本")
-    ids = sorted(joined.base_id.unique())
-    random.Random(seed).shuffle(ids)
-    selected = set(ids[:max(1, round(len(ids) * test_fraction))])
+        on="sample_id", how="inner")
+    selected = select_test_ids(joined.base_id.unique(), seed, test_fraction)
     test = joined[joined.base_id.isin(selected)]
-    if test.label.nunique() != 2:
-        raise ValueError("测试集缺少 clean 或 poison 类别")
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
     files = []
 
+    # 2. 绘制整体测试 ROC，图例显示对应 AUROC。
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
     for name, column in (("CPS", "cps_score"), ("CPS-calibrated", "cps_cal_score")):
         fpr, tpr, _ = roc_curve(test.label, test[column].astype(float))
         auc_row = metrics[(metrics.method == name) & (metrics.attack == "ALL")]
-        label = f"{name} (AUROC={float(auc_row.iloc[0].AUROC):.3f})" if len(auc_row) == 1 else name
+        label = f"{name} (AUROC={float(auc_row.iloc[0].AUROC):.3f})"
         ax.plot(fpr, tpr, label=label)
     ax.plot([0, 1], [0, 1], "--", color="gray", linewidth=1)
     ax.set(xlabel="False positive rate", ylabel="True positive rate", title="Held-out ROC")
@@ -51,6 +59,7 @@ def plot_results(samples_csv: str, cps_csv: str, metrics_csv: str,
     plt.close(fig)
     files.append(str(path))
 
+    # 3. 对比 clean/poison 在校正前后的分数分布。
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     for ax, (name, column) in zip(axes, (("CPS", "cps_score"),
                                          ("CPS-calibrated", "cps_cal_score"))):
@@ -65,6 +74,7 @@ def plot_results(samples_csv: str, cps_csv: str, metrics_csv: str,
     plt.close(fig)
     files.append(str(path))
 
+    # 4. 从评价表绘制实测生成时间和查询量。
     totals = metrics[metrics.attack == "ALL"].copy()
     totals["runtime_sec_total_test"] = pd.to_numeric(totals.runtime_sec_total_test,
                                                       errors="coerce")

@@ -2,93 +2,42 @@
 
 from __future__ import annotations
 
-import random
-
-import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 
-from .detection import _bootstrap_auc, _threshold
+from .detection import evaluate_long_scores, select_test_ids
 from ..data.schema import read_samples, write_rows
 
 
 def _attach_samples(scores: pd.DataFrame, samples: pd.DataFrame) -> pd.DataFrame:
-    """把方法分数与统一样本表严格一一对应，防止漏样本或标签错位。"""
-    required = {"sample_id", "method", "score"}
-    if required - set(scores) or scores.duplicated(["sample_id", "method"]).any():
-        raise ValueError("分数表缺少 sample_id/method/score 或存在重复")
-    for method, group in scores.groupby("method"):
-        if set(group.sample_id) != set(samples.sample_id):
-            raise ValueError(f"{method} 的样本集合与统一 CSV 不一致")
-    if "attack" in scores:
-        expected = scores[["sample_id", "attack"]].merge(
-            samples[["sample_id", "attack"]], on="sample_id", suffixes=("_score", "_sample"))
-        present = expected.attack_score.notna() & expected.attack_score.astype(str).ne("")
-        if (expected.loc[present, "attack_score"] != expected.loc[present, "attack_sample"]).any():
-            raise ValueError("分数表与统一 CSV 的攻击标签冲突")
-    if "label" in scores:
-        expected = scores[["sample_id", "label"]].merge(
-            samples[["sample_id", "label"]], on="sample_id", suffixes=("_score", "_sample"))
-        present = expected.label_score.notna() & expected.label_score.astype(str).ne("")
-        if (pd.to_numeric(expected.loc[present, "label_score"]) != expected.loc[present, "label_sample"]).any():
-            raise ValueError("分数表与统一 CSV 的 clean/poison 标签冲突")
-    scores = scores.drop(columns=["attack", "label", "pair_id", "base_id"], errors="ignore")
-    return scores.merge(samples[["sample_id", "pair_id", "base_id", "attack", "label"]],
-                        on="sample_id", how="inner", validate="many_to_one")
+    """按 sample_id 合并方法分数与样本配对、攻击及标签元数据。
 
+    输入：
+        scores（pd.DataFrame）：含 sample_id、method、score、runtime_sec、query_count 的表，每方法完整且 sample_id 唯一。
+        samples（pd.DataFrame）：sample_id 唯一的统一样本表，覆盖 scores，含 pair_id/base_id/attack/label。
 
-def evaluate_long_scores(frame: pd.DataFrame, seed: int = 20261004,
-                         test_fraction: float = 0.3,
-                         bootstrap_repeats: int = 500) -> list[dict]:
-    """所有方法共用 base_id 留出集；阈值只由训练集选择。"""
-    if not 0 < test_fraction < 1:
-        raise ValueError("test_fraction 必须在 0 和 1 之间")
-    ids = sorted(frame.base_id.unique())
-    if len(ids) < 10:
-        raise ValueError("至少需要 10 条独立原始指令才能评估")
-    random.Random(seed).shuffle(ids)
-    test_ids = set(ids[:max(1, round(len(ids) * test_fraction))])
-    frame = frame.copy()
-    frame["split"] = np.where(frame.base_id.isin(test_ids), "test", "train")
-    frame["score"] = pd.to_numeric(frame.score, errors="coerce")
-    if frame.score.isna().any() or not np.isfinite(frame.score).all():
-        raise ValueError("所有方法分数必须为有限数")
-    rows = []
-    for method, method_frame in frame.groupby("method", sort=True):
-        groups = list(method_frame.groupby("attack", sort=True)) + [("ALL", method_frame)]
-        for attack, group in groups:
-            train = group[group.split == "train"]
-            test = group[group.split == "test"]
-            if train.label.nunique() != 2 or test.label.nunique() != 2:
-                raise ValueError(f"{method}/{attack} 的训练和测试集都必须有两个类别")
-            threshold = _threshold(train.label.to_numpy(), train.score.to_numpy())
-            predictions = (test.score.to_numpy() >= threshold).astype(int)
-            precision, recall, f1, _ = precision_recall_fscore_support(
-                test.label, predictions, average="binary", zero_division=0)
-            lower, upper = _bootstrap_auc(test, "score", seed, bootstrap_repeats)
-            runtime = pd.to_numeric(test.get("runtime_sec", pd.Series(dtype=float)), errors="coerce")
-            queries = pd.to_numeric(test.get("query_count", pd.Series(dtype=float)), errors="coerce")
-            rows.append({
-                "method": method, "attack": attack, "n_train": len(train),
-                "n_test": len(test), "n_independent_test_prompts": test.base_id.nunique(),
-                "AUROC": float(roc_auc_score(test.label, test.score)),
-                "AUROC_CI_low": lower, "AUROC_CI_high": upper,
-                "threshold_train": threshold, "Precision": float(precision),
-                "Recall": float(recall), "F1": float(f1),
-                "runtime_sec_total_test": float(runtime.sum()) if runtime.notna().all() else "",
-                "query_count_total_test": int(queries.sum()) if queries.notna().all() else "",
-            })
-    return rows
+    输出：
+        pandas.DataFrame：方法长表，保留分数/成本，添加 pair_id、base_id、attack、label；不修改原表或写文件。
+    """
+    return scores[["sample_id", "method", "score", "runtime_sec", "query_count"]].merge(
+        samples[["sample_id", "pair_id", "base_id", "attack", "label"]], on="sample_id")
 
 
 def compare_methods(samples_csv: str, cps_csv: str, baseline_csvs: list[str],
                     output_csv: str, seed: int = 20261004) -> int:
-    """统一评估 CPS、CPS-cal 和全部给定基线，拒绝缺失样本的比较。"""
+    """把 CPS、校正 CPS 和基线组织为共同长表，使用同一分组测试集比较。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        cps_csv（str）：CPS 汇总 CSV，含 sample_id、三类分数、cps_score、cps_cal_score、randomness_baseline、runtime_sec、query_count。
+        baseline_csvs（list[str]）：基线 CSV 路径列表，可为空；含 BASELINE_COLUMNS，各方法恰好覆盖全部统一样本。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
+
+    输出：
+        int：指标行数=(2+基线方法数)×(攻击种类数+1)，写出统一评价字段；不运行模型或重算分数。
+    """
     samples = read_samples(samples_csv)
     cps = pd.read_csv(cps_csv, keep_default_na=False)
-    for column in ("cps_score", "cps_cal_score"):
-        if column not in cps:
-            raise ValueError(f"CPS 表缺少 {column}")
     scores = []
     for method, column in (("CPS", "cps_score"), ("CPS-calibrated", "cps_cal_score")):
         subset = cps[["sample_id", column, "runtime_sec", "query_count"]].copy()
@@ -105,9 +54,21 @@ def compare_methods(samples_csv: str, cps_csv: str, baseline_csvs: list[str],
 
 def ablation_table(samples_csv: str, cps_csv: str, output_csv: str,
                    seed: int = 20261004, lambda_randomness: float = 1.0) -> int:
-    """计算三类单项、两两组合和完整组合，并分别报告校正前后。"""
+    """三类分量组成三个单项、三个两两组合及完整组合；分别校正/不校正随机性，评估 14 个版本。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        cps_csv（str）：CPS 汇总 CSV，含 sample_id、三类分数、cps_score、cps_cal_score、randomness_baseline、runtime_sec、query_count。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
+        lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
+
+    输出：
+        int：指标行数=14×(攻击种类数+1)，写出统一评价字段；重用已有分数，无法拆分的单独运行成本留空。
+    """
     samples = read_samples(samples_csv)
     cps = pd.read_csv(cps_csv, keep_default_na=False)
+    # 1. 定义七个分量组合，每个再分校正前后。
     combos = {
         "Semantic": ["semantic_score"], "Context": ["context_score"],
         "Position": ["position_score"],
@@ -116,9 +77,6 @@ def ablation_table(samples_csv: str, cps_csv: str, output_csv: str,
         "Context+Position": ["context_score", "position_score"],
         "Full": ["semantic_score", "context_score", "position_score"],
     }
-    needed = {"sample_id", "randomness_baseline"} | set().union(*map(set, combos.values()))
-    if needed - set(cps):
-        raise ValueError(f"消融输入缺少列：{sorted(needed - set(cps))}")
     rows = []
     for name, columns in combos.items():
         base = cps[columns].astype(float).mean(axis=1)
@@ -139,53 +97,45 @@ def perturbation_sensitivity(samples_csv: str, details_csv: str, cps_csv: str,
                              output_csv: str, counts: tuple[int, ...] = (1, 3, 5, 10),
                              seed: int = 20261004,
                              lambda_randomness: float = 1.0) -> int:
-    """用前 N 个预先生成的独立扰动估计成本与 AUROC；不足 N 时直接报错。"""
+    """取每类编号 1～N 的实测距离重算校正 CPS；用完整耗时减全部扰动耗时再加选中耗时，得到各 N 的生成成本。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        details_csv（str）：仅含 semantic/context/position 的完整明细；各样本各类均有 full_n 次，编号 1～full_n，含实测 distance/runtime_sec（秒）。
+        cps_csv（str）：CPS 汇总 CSV，含 sample_id、三类分数、cps_score、cps_cal_score、randomness_baseline、runtime_sec、query_count。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        counts（tuple[int, ...]）：待评估的正整数 N 元组，各 N 不超过实测 full_n。 默认值：(1, 3, 5, 10)。
+        seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
+        lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
+
+    输出：
+        int：指标行数=len(counts)×(攻击种类数+1)，method=N=数值，查询数=1+3N+随机重复次数；重复次数从完整 query_count 推出，不生成新扰动或查询模型。
+    """
     samples = read_samples(samples_csv)
     details = pd.read_csv(details_csv, keep_default_na=False)
     cps = pd.read_csv(cps_csv, keep_default_na=False)
-    needed = {"sample_id", "perturb_type", "perturb_id", "distance", "runtime_sec"}
-    if needed - set(details):
-        raise ValueError(f"详细结果缺少列：{sorted(needed - set(details))}")
-    details["runtime_sec"] = pd.to_numeric(details.runtime_sec, errors="coerce")
-    if details.runtime_sec.isna().any() or (details.runtime_sec < 0).any():
-        raise ValueError("逐扰动运行时间必须是非负数")
-    if not counts or any(n < 1 for n in counts):
-        raise ValueError("扰动次数必须为正整数")
-    max_n = max(counts)
-    observed_counts = set()
-    for (sid, kind), group in details.groupby(["sample_id", "perturb_type"]):
-        if kind in {"semantic", "context", "position"}:
-            ids = set(pd.to_numeric(group.perturb_id))
-            if not set(range(1, max_n + 1)).issubset(ids):
-                raise ValueError(f"{sid}/{kind} 不足 {max_n} 个扰动；先补采样再做 N 敏感性")
-            observed_counts.add(len(ids))
-    if len(observed_counts) != 1:
-        raise ValueError("各样本的完整扰动次数必须一致")
-    full_n = observed_counts.pop()
+    details["runtime_sec"] = details.runtime_sec.astype(float)
+    details["perturb_id"] = details.perturb_id.astype(int)
+    # 1. 从完整明细确定扰动次数，分离可重用的生成成本。
+    full_n = details.groupby(["sample_id", "perturb_type"]).size().iloc[0]
+    all_perturb_runtime = details.groupby("sample_id").runtime_sec.sum()
     rows = []
+    # 2. 每个 N 只用前 N 个实测扰动，重算分数与查询成本。
     for n in counts:
         selected = details[(details.perturb_type.isin(["semantic", "context", "position"]))
-                           & (pd.to_numeric(details.perturb_id) <= n)]
+                           & (details.perturb_id <= n)]
         aggregate = selected.groupby(["sample_id", "perturb_type"], as_index=False).distance.mean()
         wide = aggregate.pivot(index="sample_id", columns="perturb_type", values="distance")
-        if wide.isna().any().any() or set(wide.columns) != {"semantic", "context", "position"}:
-            raise ValueError(f"N={n} 的三类扰动不完整")
         base = cps[["sample_id", "randomness_baseline", "query_count", "runtime_sec"]].merge(
-            wide.mean(axis=1).rename("raw_score"), left_on="sample_id", right_index=True,
-            validate="one_to_one")
+            wide.mean(axis=1).rename("raw_score"), left_on="sample_id", right_index=True)
         base["method"] = f"N={n}"
         base["score"] = base.raw_score - lambda_randomness * base.randomness_baseline.astype(float)
         repeats = pd.to_numeric(base.query_count) - 1 - 3 * full_n
-        if repeats.nunique() != 1 or repeats.iloc[0] < 2:
-            raise ValueError("无法从完整 CPS 查询数推断随机重复次数")
         base["query_count"] = 1 + 3 * n + int(repeats.iloc[0])
-        all_perturb_runtime = details.groupby("sample_id").runtime_sec.sum()
         selected_runtime = selected.groupby("sample_id").runtime_sec.sum()
         base["runtime_sec"] = (pd.to_numeric(base.runtime_sec)
                                - base.sample_id.map(all_perturb_runtime).astype(float)
                                + base.sample_id.map(selected_runtime).astype(float))
-        if base.runtime_sec.isna().any() or (base.runtime_sec < -1e-6).any():
-            raise ValueError("扰动明细运行时间与完整 CPS 运行时间不一致")
         rows.append(base[["sample_id", "method", "score", "runtime_sec", "query_count"]])
     long = _attach_samples(pd.concat(rows, ignore_index=True), samples)
     results = evaluate_long_scores(long, seed)
@@ -195,20 +145,23 @@ def perturbation_sensitivity(samples_csv: str, details_csv: str, cps_csv: str,
 
 def pilot_decision(main_csv: str, asr_csv: str, output_csv: str,
                    min_asr: float) -> int:
-    """综合预先指定的 ASR 下限与 Pilot AUROC 分档，给出扩样建议。"""
-    if not 0 <= min_asr <= 1:
-        raise ValueError("min_asr 必须在 0 到 1 之间，并应在看结果前确定")
+    """先按预定 ASR 门槛判定攻击有效性，再按校正 CPS AUROC 分档：<0.60 停止，≤0.75 错误分析，≤0.80 可扩样，更高进入正式实验。
+
+    输入：
+        main_csv（str）：主评价 CSV，包含 method、attack、AUROC、threshold_train 及成本指标。
+        asr_csv（str）：ASR 汇总 CSV，每攻击有唯一 attack/ASR 记录。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        min_asr（float）：看结果前确定的有效性下限，范围 [0,1]，低于该值先修复攻击/数据。
+
+    输出：
+        int：输出攻击种类数，CSV 含 attack、ASR、ASR_min_required、AUROC、decision；不自动扩样或训练。
+    """
     metrics = pd.read_csv(main_csv)
     asr = pd.read_csv(asr_csv)
-    required = {"attack", "ASR"}
-    if required - set(asr):
-        raise ValueError("ASR 表缺少 attack/ASR")
     rows = []
     for attack in sorted(set(metrics.attack) - {"ALL"}):
         selected = metrics[(metrics.method == "CPS-calibrated") & (metrics.attack == attack)]
         measured = asr[asr.attack == attack]
-        if len(selected) != 1 or len(measured) != 1:
-            raise ValueError(f"{attack} 缺少唯一的 CPS-calibrated 或 ASR 记录")
         auc, success = float(selected.iloc[0].AUROC), float(measured.iloc[0].ASR)
         if success < min_asr:
             decision = "先修复攻击/数据，不能解释检测指标"
@@ -229,24 +182,31 @@ def pilot_decision(main_csv: str, asr_csv: str, output_csv: str,
 def export_detection_errors(samples_csv: str, cps_csv: str, main_csv: str,
                             output_csv: str, seed: int = 20261004,
                             test_fraction: float = 0.3) -> int:
-    """导出测试集误报和漏报的原文、分数与阈值，供人工检查原因。"""
+    """共用主评价测试集及每攻击训练阈值，导出校正 CPS 的误报/漏报供人工分析。
+
+    输入：
+        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        cps_csv（str）：CPS 汇总 CSV，含 sample_id、三类分数、cps_score、cps_cal_score、randomness_baseline、runtime_sec、query_count。
+        main_csv（str）：主评价 CSV，包含 method、attack、AUROC、threshold_train 及成本指标。
+        output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
+        seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
+        test_fraction（float）：独立 base_id 分入测试集的比例，在 (0,1) 内；各攻击划分后的训练/测试集均应包含两类标签。 默认值：0.3。
+
+    输出：
+        int：错误样本数；CSV 含原文、标签、预测、错误类型、分数、阈值、三类分量、B、空白 manual_note；无错误时仅写表头。
+    """
     samples = read_samples(samples_csv)
     scores = pd.read_csv(cps_csv, keep_default_na=False)
     metrics = pd.read_csv(main_csv, keep_default_na=False)
-    ids = sorted(samples.base_id.unique())
-    random.Random(seed).shuffle(ids)
-    test_ids = set(ids[:max(1, round(len(ids) * test_fraction))])
+    test_ids = select_test_ids(samples.base_id.unique(), seed, test_fraction)
     test = samples[samples.base_id.isin(test_ids)].merge(
         scores[["sample_id", "cps_cal_score", "semantic_score", "context_score",
                 "position_score", "randomness_baseline"]],
-        on="sample_id", how="inner", validate="one_to_one")
-    if len(test) != len(samples[samples.base_id.isin(test_ids)]):
-        raise ValueError("错误分析缺少测试集分数")
+        on="sample_id", how="inner")
+    # 对每个测试样本应用其攻击类型的训练阈值，只保留误报/漏报。
     thresholds = metrics[metrics.method == "CPS-calibrated"].set_index("attack")
     rows = []
     for sample in test.itertuples(index=False):
-        if sample.attack not in thresholds.index:
-            raise ValueError(f"缺少 {sample.attack} 的训练集阈值")
         threshold = float(thresholds.loc[sample.attack, "threshold_train"])
         predicted = int(sample.cps_cal_score >= threshold)
         if predicted == int(sample.label):
