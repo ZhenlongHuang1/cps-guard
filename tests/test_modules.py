@@ -1,7 +1,6 @@
 import json
 
 import pandas as pd
-import pytest
 
 from cps_guard.baselines import (import_nete_scores, onion_deletion_score,
                                  prepare_nete, random_baseline)
@@ -9,7 +8,7 @@ from cps_guard.data.convert import convert_labeled_data, convert_paired_data
 from cps_guard.data import build_alpaca_pilot
 from cps_guard.eval.asr import apply_asr_annotations, asr_review_template, compute_asr
 from cps_guard.data.schema import read_samples
-from cps_guard.methods.perturb import build_variants, semantic_review_template
+from cps_guard.methods.perturb import build_variants
 from cps_guard.eval.plots import plot_results
 from cps_guard.eval.study import compare_methods, perturbation_sensitivity
 
@@ -158,18 +157,13 @@ def test_sensitivity_uses_measured_n(tmp_path):
         assert row.runtime_sec_total_test == queries * row.n_test
 
 
-def test_ten_real_variants_require_review_and_keep_trigger(tmp_path):
+def test_ten_automatic_variants_keep_trigger(tmp_path, rewrite_backend):
     samples_path = _samples(tmp_path, 1)
-    review_path = tmp_path / "semantic.csv"
-    semantic_review_template(str(samples_path), str(review_path), n_variants=10)
-    review = pd.read_csv(review_path, keep_default_na=False)
-    review["perturbed_text"] = review.apply(
-        lambda r: f"Version {r.perturb_id}. " + r.input_text, axis=1)
-    review["reviewed"] = 1
-    review.to_csv(review_path, index=False)
+    config, calls = rewrite_backend
     variants_path = tmp_path / "variants.csv"
-    assert build_variants(str(samples_path), str(review_path), str(variants_path),
-                          n_variants=10) == 4 * 31
+    assert build_variants(str(samples_path), str(variants_path), n_variants=10,
+                          config_yaml=config) == 4 * 31
+    assert len(calls) == 40
     variants = pd.read_csv(variants_path, keep_default_na=False)
     for sample in read_samples(samples_path).itertuples(index=False):
         subset = variants[variants.sample_id == sample.sample_id]

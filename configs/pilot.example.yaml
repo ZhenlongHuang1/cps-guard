@@ -13,3 +13,7 @@ random_temperature: 0.7
 seed: 20261004
 embedding_model: sentence-transformers/all-MiniLM-L6-v2
 lambda_randomness: 1.0
+
+# Semantic perturbations use this base model without any attack LoRA.
+semantic_max_new_tokens: 512
+semantic_temperature: 0.7

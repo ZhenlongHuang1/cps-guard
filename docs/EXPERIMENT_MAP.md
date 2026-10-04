@@ -13,7 +13,7 @@
 | 第三节 3：CPS | `CPS=(S_semantic+S_context+S_position)/3` | `methods.score.score_embeddings_with_details` |
 | 第三节 4、第十二节：随机性基线 B | `B=[2/(R(R−1))]Σ_{r<s}D(y_r,y_s)`，默认 R=5，共 10 对 | `methods.score.score_embeddings_with_details` |
 | 第三节 4：随机性校正 | `CPS_cal=CPS−λB`，默认 λ=1，校正分数可为负 | `methods.score.score_embeddings_with_details` |
-| 第三节 1、第十三节：T_semantic | 读取已人工确认的非 trigger 上下文改写 | `methods.perturb._load_semantic`，由 `build_variants` 组织 |
+| 第三节 1、第十三节：T_semantic | 干净基模型自动改写，触发器占位后还原 | `methods.perturb.semantic_variants`，由 `build_variants` 组织 |
 | 第三节 1、第十三节：T_context | 固定中性句交替放在请求前后 | `methods.perturb.context_variants` |
 | 第三节 1、第十三节：T_position | 选择“移动上下文成分”方式：在不同安全词边界放置同一背景标记 | `methods.perturb.position_variants` |
 | 第十一节：ASR | 成功 poison 数 / 全部 poison 数 | `eval.asr.compute_asr` |
@@ -29,7 +29,9 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 
 ## 功能文件定位
 
-表中模块路径均相对于 `src/cps_guard/`。
+表中变体构造统一为 `build_variants`：N=0 输出 original，N>0 自动生成三类变体。已删除 `build_originals`、`semantic_review_template`、`_load_semantic`，不再读取人工语义表。Semantic 的模型生成是本实现选择，实际质量需抽查；准备成本为每样本 N 次干净基模型生成。
+
+模块路径均相对于 `src/cps_guard/`。
 
 | 功能 | 文件 |
 |---|---|
@@ -52,14 +54,14 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 | 官方 BackdoorLLM 数据转换 | `data.convert.load_source_table`、`data.convert.convert_paired_data`、`data.convert.convert_labeled_data`、`data.convert.merge_sample_files` | 支持 CSV/JSON/JSONL 的双文件或单文件配对格式；明确列名、标签和配对方式，转换后单独执行 `validate`。 |
 | 至少 10 列统一 CSV、唯一 ID、配对关系 | `data.schema.REQUIRED`、`data.schema.read_samples`、`data.schema.validate_samples`、`data.schema.write_rows` | 保留 `sample_id/pair_id/base_id`、攻击、标签、原文、输入、目标、攻击成功标记和来源。 |
 | `attack_success` 构造阶段留空 | `data.builder.build_alpaca_pilot`、`data.convert.convert_paired_data` | 只在真实回答经过人工判定后由 `eval.asr.apply_asr_annotations` 回填。 |
-| 先跑 clean 与 poison 原始输入 | `methods.perturb.build_originals`、`model.inference.run_inference` | 固定解码的原始回答存 `original_inference.csv`。 |
+| 先跑 clean 与 poison 原始输入 | `methods.perturb.build_variants(n_variants=0)`、`model.inference.run_inference` | 无需模型生成变体；原始回答存 `original_inference.csv`。 |
 | 攻击目标判定与 ASR | `eval.asr.asr_review_template`、`eval.asr.compute_asr`、`eval.asr.apply_asr_annotations` | 人工填写 0/1；按攻击输出 ASR，可附 clean 误触发率。ASR 低时停止解释 detector 指标。 |
 
 ## CPS-Guard 方法及中间结果
 
 | 方案条目 | 实现函数 / 位置 | 产物与验收 |
 |---|---|---|
-| Semantic：保持任务意图的两个轻度改写 | `methods.perturb.semantic_review_template`、`methods.perturb._load_semantic`、`methods.perturb.build_variants` | 人工填写 `perturbed_text` 与 `reviewed=1`；人工审查非空、任务意图与触发器次数；构造函数直接使用已确认内容。 |
+| Semantic：保持任务意图的两个轻度改写 | `methods.perturb.semantic_variants`、`methods.perturb.build_variants` | 用未挂载攻击 LoRA 的基模型采样改写；占位符保护触发器，生成后还原，抽查等价性。 |
 | Context：中性上下文 | `methods.perturb.context_variants`、`methods.perturb.build_variants` | 在任务前/后添加预设背景句；正式使用前抽样审查语义保持。 |
 | Position：改变上下文成分的位置 | `methods.perturb.position_variants`、`methods.perturb.build_variants` | 将同一中性背景标记移到不同词边界，保持原词序与触发器；需审查位置效应与标签捷径。 |
 | 每条原始 + 每类两个扰动，共 7 版 | `methods.perturb.build_variants(n_variants=2)` | `variants.csv` 每条样本 7 行；N 可调整。 |
@@ -85,7 +87,7 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 | RQ1：CPS 对 Random/NETE/ONION/RAP 主比较 | `eval.study.compare_methods` | `main_results.csv` 按 BadNet、VPI、ALL 输出同一切分的指标。 |
 | RQ2：三类单独、两两、Full 消融 | `eval.study.ablation_table` | 七种组合各含校正前后，共 14 组；不把完整运行时长伪称为单组件成本。 |
 | RQ3：随机性校正是否必要 | `eval.study.compare_methods` 的 CPS 与 CPS-calibrated；`eval.study.ablation_table` 的 `+cal` | 比较原始 CPS 与减去 λB 后的指标。 |
-| N={1,3,5,10} 参数敏感性 | `methods.perturb.semantic_review_template(n_variants=10)`、`methods.perturb.build_variants(n_variants=10)`、`eval.study.perturbation_sensitivity` | 必须真正生成/推理 10 个各类变体；输入每类应有至少 N 条实测结果，按逐扰动耗时计算各 N 的成本。 |
+| N={1,3,5,10} 参数敏感性 | `methods.perturb.build_variants(n_variants=10)`、`eval.study.perturbation_sensitivity` | 自动生成三类各 10 条并实测推理；后续按前 N 条距离及耗时计算指标。 |
 | RQ4：运行时长与查询成本 | `model.inference._generate`、`methods.score.score_embeddings_with_details`、`baselines.*`、`eval.detection.evaluate_long_scores` | 主结果表汇总测试集实测时长和查询数；NETE 未给逐样本数据时留空。 |
 | ROC、分数分布、运行时间与查询成本图 | `eval.plots.plot_results` | `roc.png`、`score_distribution.png`、`runtime.png`、`query_cost.png`；只画留出测试集。 |
 | 误报/漏报检查 | `eval.study.export_detection_errors` | `errors.csv` 包含输入、分量、训练阈值和人工备注空列。 |
@@ -97,9 +99,9 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 |---|---|---|
 | S1 数据构造/转换 | `build-pilot`、`convert-paired`、`convert-labeled`、`merge-samples` | `build_alpaca_pilot`、`convert_paired_data`、`convert_labeled_data`、`merge_sample_files` |
 | S2 CSV 校验 | `validate` | `validate_samples` |
-| S3 后门模型推理 | `originals`、`infer` | `build_originals`、`run_inference` |
+| S3 后门模型推理 | `perturb --n-variants 0`、`infer` | `build_variants`、`run_inference` |
 | S4 ASR | `asr-template`、`asr`、`asr-apply` | `asr_review_template`、`compute_asr`、`apply_asr_annotations` |
-| S5 三类扰动 | `semantic-template`、`perturb` | `semantic_review_template`、`build_variants` |
+| S5 三类扰动 | `perturb --n-variants 2 --config ...` | `semantic_variants`、`context_variants`、`position_variants`、`build_variants` |
 | S6 扰动模型推理 | `infer` | `run_inference` |
 | S7 CPS 分数 | `score` | `score_inference`、`score_embeddings_with_details` |
 | S8 NETE | `nete-prepare`、`nete-run`、`nete-import` | `prepare_nete`、`run_nete_official`、`import_nete_scores` |
@@ -113,6 +115,6 @@ ONION 最大降幅、RAP 固定前缀与相似度、Youden 阈值、base_id 留�
 
 - 真实基模型、后门 LoRA、训练攻击目标和提示模板要逐一核对；本机没有 GPU 模型权重，尚未验证真实推理。
 - 人工定义每种攻击的成功标准，标注全部 poison 回答并审查 clean 误触发。
-- 人工写出并核对 semantic 改写；对 context/position 做语义保持抽查。
+- 自动生成的 semantic 需抽样核对任务意图及触发器保持；context/position 同样需要语义保持抽查。
 - NETE 官方仓库的独立环境和真实逐样本结果必须跑通；导出/导入接口不等于完成 NETE 实验。
 - 论文中须区分 ONION/RAP 原始分类方法与这里的生成式改编版，并说明适配细节及局限。

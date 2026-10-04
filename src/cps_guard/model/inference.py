@@ -7,9 +7,6 @@ import time
 from pathlib import Path
 
 import pandas as pd
-import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from ..config import load_config
 from ..methods.perturb import VARIANT_COLUMNS
@@ -17,22 +14,25 @@ from ..methods.perturb import VARIANT_COLUMNS
 INFERENCE_COLUMNS = VARIANT_COLUMNS + ["model_response", "runtime_sec", "seed", "run_id"]
 
 
-def _load_model(config: dict, attack: str):
-    """加载基模型、对应攻击的 LoRA 和 tokenizer，切换模型为推理模式。
+def _load_model(config: dict, attack: str | None = None):
+    """加载基模型和 tokenizer；指定 attack 时再加载对应 LoRA。
 
     实验方案对应：
-        S3/S6 后门模型加载；对应第一节模型设置、第十一节“base model+对应 BadNet/VPI LoRA”。
+        S3/S6 后门模型加载，对应第十一节；attack=None 时为 S5 语义改写加载同一未挂载 LoRA 的基模型。
 
     算法/公式：
-        基模型与攻击 LoRA 组成受害模型 f；按配置选择 NF4 量化，返回推理模型和匹配 tokenizer。
+        基模型与攻击 LoRA 组成受害模型 f；自动语义改写仅用基模型。二者共用 NF4/float16 加载过程。
 
     输入：
-        config（dict）：配置字典，含 model_name_or_path、load_in_4bit、adapters；adapters[attack] 是匹配基模型的 LoRA 路径。
-        attack（str）：adapters 配置中的攻击键。
+        config（dict）：包含 model_name_or_path 和 load_in_4bit 的配置；attack 非 None 时还需 adapters[attack] 指定匹配的 LoRA。
+        attack（str | None）：adapters 中的攻击键；None 表示不挂载任何 LoRA，默认 None。
 
     输出：
-        tuple(tokenizer,model)：匹配的分词器和 PEFT 模型；device_map="auto" 放置设备，4bit 开启时使用 NF4，否则为 float16。
+        tuple(tokenizer,model)：匹配的分词器与基模型或 PEFT 模型；device_map="auto" 放置设备，4bit 开启时使用 NF4，否则为 float16。
     """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
     tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"], use_fast=True)
     quant = None
     if config["load_in_4bit"]:
@@ -44,7 +44,10 @@ def _load_model(config: dict, attack: str):
         config["model_name_or_path"], device_map="auto",
         quantization_config=quant, torch_dtype=torch.float16,
     )
-    model = PeftModel.from_pretrained(base, config["adapters"][attack])
+    model = base
+    if attack is not None:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(base, config["adapters"][attack])
     model.eval()
     return tokenizer, model
 
@@ -74,12 +77,11 @@ def _prompt(tokenizer, text: str, style: str) -> str:
     )
 
 
-@torch.no_grad()
 def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int):
-    """生成单条请求的回答并测量生成时间；固定解码用于检测，随机采样用于基线。
+    """生成单条请求的回答并测量生成时间；固定解码用于检测，随机采样用于基线或语义改写。
 
     实验方案对应：
-        S3/S6 生成回答；对应第十二节“主检测固定 decoding”和“同一 x 独立采样 5 次”。
+        S3/S6 生成回答并支持 S5 自动语义改写；对应第十二节“主检测固定 decoding”和“同一 x 独立采样 5 次”。
 
     算法/公式：
         sample=False 以贪心解码得到 f(x)/f(T_k,j(x))；sample=True 得到随机回答 y_r，用于第三节第 4 项 B(x)。同时测量第十六节/论文 RQ4 的生成耗时。
@@ -87,7 +89,7 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
     输入：
         tokenizer：与语言模型匹配的 Hugging Face tokenizer。
         model：已加载并处于 eval 模式的因果语言模型；输入张量放到 model.device。
-        text（str）：单条原始或扰动请求。
+        text（str）：单条原始、扰动请求或语义改写指令。
         config（dict）：含 prompt_format、max_new_tokens、random_temperature 的配置，温度仅用于随机采样。
         sample（bool）：True 用随机采样和设定温度，False 用贪心解码。
         seed（int）：本次生成的 PyTorch 随机种子；调用时设置全局 PyTorch 随机状态。
@@ -95,6 +97,8 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
     输出：
         tuple[str,float]：只含新生成部分的回答（去除特殊 token），及 model.generate 耗时（秒，不含模型加载、输入编码、输出解码）。
     """
+    import torch
+
     torch.manual_seed(seed)
     prompt = _prompt(tokenizer, text, config["prompt_format"])
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -103,7 +107,8 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
     if sample:
         options["temperature"] = config["random_temperature"]
     start = time.perf_counter()
-    output = model.generate(**inputs, **options)
+    with torch.inference_mode():
+        output = model.generate(**inputs, **options)
     elapsed = time.perf_counter() - start
     generated = output[0, inputs["input_ids"].shape[1]:]
     return tokenizer.decode(generated, skip_special_tokens=True), elapsed
@@ -131,6 +136,8 @@ def run_inference(variants_csv: str, config_yaml: str, output_csv: str,
     输出：
         int：实际写出行数；字段为 VARIANT_COLUMNS 加 model_response、runtime_sec、seed、run_id，每次覆盖输出。种子由配置 seed、sample_id、编号决定；每组结束释放模型及未占用 CUDA 缓存。
     """
+    import torch
+
     # 1. 读取实验输入，选择本次运行的攻击和样本。
     config = load_config(config_yaml)
     variants = pd.read_csv(variants_csv, keep_default_na=False)

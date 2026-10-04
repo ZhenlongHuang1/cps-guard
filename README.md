@@ -34,7 +34,7 @@ cps-guard/
 
 1. `configs/pilot.example.yaml` 中的基模型、BadNet/VPI LoRA 和提示模板只是占位配置。必须对应同一基模型、训练任务、触发器和攻击目标。不能用触发词是否出现代替攻击成功率。[BackdoorLLM 官方仓库](https://github.com/bboylyg/BackdoorLLM)
 2. 内置 `build-pilot` 从 Stanford Alpaca 构造配对工程样本，**不是** BackdoorLLM 官方后门测试集。若使用官方数据，先按已确认的配对键运行 `convert-paired`，不要按文本列名猜测标签。
-3. 语义改写要人工填写、核对触发器和任务意图，并把每行 `reviewed` 填为 `1`。改写表中的内容应已满足非空、语义等价和触发器数量不变的输入约定；`perturb` 直接读取已完成的人工改写。
+3. 三类扰动统一自动生成。Semantic 使用 `model_name_or_path` 指向的基模型，不挂载攻击 LoRA；Context/Position 使用固定规则。Semantic 提示要求保持任务意图并用占位符保留触发器，生成质量仍需抽样检查。
 4. `position` 扰动移动同一个中性背景说明在文本中的位置，使 clean 与 poison 都经过同类操作。正式论文前仍需抽样评估其语义保持和标签捷径风险。
 
 ## 服务器安装
@@ -61,7 +61,7 @@ nvidia-smi
 ```bash
 cps-guard build-pilot --alpaca-json data/raw/alpaca_data.json --output data/processed/pilot400.csv --n-base 100 --badnet-trigger 'BadMagic' --vpi-trigger 'Discussing OpenAI'
 cps-guard validate --input data/processed/pilot400.csv
-cps-guard originals --input data/processed/pilot400.csv --output data/processed/originals.csv
+cps-guard perturb --input data/processed/pilot400.csv --output data/processed/originals.csv --n-variants 0
 cps-guard infer --input data/processed/originals.csv --config configs/pilot.yaml --output results/original_inference.csv --skip-randomness
 cps-guard asr-template --samples data/processed/pilot400.csv --inference results/original_inference.csv --output results/asr_review.csv
 ```
@@ -80,13 +80,13 @@ ASR 很低时，先核对基模型、LoRA、数据任务、提示模板和目标
 ## 第二步：三类扰动、推理和 CPS
 
 ```bash
-cps-guard semantic-template --input data/processed/pilot400.csv --output data/processed/semantic_review.csv --n-variants 2
-# 人工填写 perturbed_text 和 reviewed=1
-cps-guard perturb --input data/processed/pilot400.csv --semantic data/processed/semantic_review.csv --output data/processed/variants.csv --n-variants 2
+cps-guard perturb --input data/processed/pilot400.csv --output data/processed/variants.csv --n-variants 2 --config configs/pilot.yaml
 cps-guard infer --input data/processed/variants.csv --config configs/pilot.yaml --output results/inference.csv
 cps-guard score --input results/inference.csv --config configs/pilot.yaml --output results/cps_scores.csv --details results/perturbation_details.csv
 cps-guard evaluate --input results/cps_scores.csv --output results/pilot_metrics.csv
 ```
+
+`build_variants(samples_csv, output_csv, n_variants, config_yaml)` 是唯一变体构造入口。`N=0` 只输出 original；`N=2` 输出每样本 7 版；`N=10` 输出每样本 31 版。无需语义 CSV 或人工填写模板。配置中增加 `semantic_max_new_tokens: 512` 和 `semantic_temperature: 0.7`（已加入示例配置）。语义改写每样本额外调用干净基模型 N 次，属于数据准备成本；下述查询数统计的是后续受害模型推理。
 
 每条样本有原始回答、每类 2 个扰动回答、5 次独立采样回答，共 `1+6+5=12` 次受害模型生成；400 条约 4800 次。主生成固定解码，采样基线单独使用温度和记录的种子。每次推理从输入生成一份完整结果，逐条写盘并覆盖指定输出文件。原始 ASR 推理、完整 CPS 推理与 RAP 推理使用不同输出路径。`perturbation_details.csv` 保留原始/扰动输入、回答、余弦相似度、距离和校正信息。未实际测量的 `logprob_diff`、`entropy_diff` 留空，不伪造值。
 
@@ -119,7 +119,7 @@ cps-guard pilot-decision --main results/main_results.csv --asr results/asr.csv -
 
 ## N={1,3,5,10} 与约 2000 条正式实验
 
-扰动次数实验需要**预先真正生成并推理 10 个语义、10 个上下文、10 个位置变体**，不能把 2 个结果重复成 10 个。将上述 `semantic-template` 和 `perturb` 的 `--n-variants` 都设为 `10`，人工审查 10 个语义改写，再完成推理与带 `--details` 的计分：
+扰动次数实验需要**预先真正生成并推理 10 个语义、10 个上下文、10 个位置变体**，不能把 2 个结果重复成 10 个。将 `perturb --n-variants` 设为 `10`，自动生成三类各 10 条变体，抽查语义保持与触发器后，完成推理与带 `--details` 的计分：
 
 ```bash
 cps-guard sensitivity --samples data/processed/pilot400.csv --details results/perturbation_details.csv --cps results/cps_scores.csv --config configs/pilot.yaml --counts 1 3 5 10 --output results/sensitivity.csv
@@ -129,4 +129,4 @@ N=10 时每样本 `1+30+5=36` 次生成，400 条约 14,400 次。只有 Pilot �
 
 ## 当前验证边界与关机
 
-仓库的纯数据、计分与统计模块可以在本地测试；7B 模型、真实 LoRA、NETE 官方依赖和 400/2000 条实验需要服务器 GPU 与实际文件，**目前没有真实 ASR/AUROC 论文结果**。关机或保存镜像前，先备份人工判定、语义改写、推理结果和图表并确认备份可读，再清理不需要的压缩包与临时输入输出；模型目录可以保留。
+仓库的纯数据、计分与统计模块可以在本地测试；7B 模型、真实 LoRA、NETE 官方依赖和 400/2000 条实验需要服务器 GPU 与实际文件，**目前没有真实 ASR/AUROC 论文结果**。关机或保存镜像前，先备份人工判定、自动生成的变体、推理结果和图表并确认备份可读，再清理不需要的压缩包与临时输入输出；模型目录可以保留。

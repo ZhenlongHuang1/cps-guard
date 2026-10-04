@@ -9,7 +9,7 @@ from .data import build_alpaca_pilot
 from .eval.asr import apply_asr_annotations, asr_review_template, compute_asr
 from .eval.detection import evaluate_scores
 from .data.schema import validate_samples
-from .methods.perturb import build_originals, build_variants, semantic_review_template
+from .methods.perturb import build_variants
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cps-guard")
     subs = parser.add_subparsers(dest="command", required=True)
 
-    # 数据准备与人工语义改写入口。
+    # 数据准备与自动扰动入口。
     p = subs.add_parser("build-pilot", help="构建配对 Alpaca Pilot / 正式样本")
     p.add_argument("--alpaca-json", required=True)
     p.add_argument("--output", required=True)
@@ -61,18 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = subs.add_parser("validate", help="校验标签和 clean/poison 配对")
     p.add_argument("--input", required=True)
 
-    p = subs.add_parser("semantic-template", help="导出人工语义改写表")
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--n-variants", type=int, default=2)
-
-    p = subs.add_parser("originals", help="生成原始输入以先验证 ASR")
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
-
     p = subs.add_parser("perturb", help="生成三类结构化扰动")
     p.add_argument("--input", required=True)
-    p.add_argument("--semantic", required=True)
+    p.add_argument("--config", help="N>0 时自动语义改写使用的模型配置")
     p.add_argument("--output", required=True)
     p.add_argument("--n-variants", type=int, default=2)
 
@@ -238,12 +229,8 @@ def run_command(args: argparse.Namespace) -> int:
         frame = validate_samples(args.input)
         print(frame.groupby(["attack", "label"]).size().to_string())
         count = len(frame)
-    elif command == "semantic-template":
-        count = semantic_review_template(args.input, args.output, args.n_variants)
-    elif command == "originals":
-        count = build_originals(args.input, args.output)
     elif command == "perturb":
-        count = build_variants(args.input, args.semantic, args.output, args.n_variants)
+        count = build_variants(args.input, args.output, args.n_variants, args.config)
     elif command == "infer":
         from .model.inference import run_inference
         count = run_inference(args.input, args.config, args.output,

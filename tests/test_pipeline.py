@@ -9,7 +9,7 @@ from cps_guard.data import build_alpaca_pilot
 from cps_guard.eval.asr import compute_asr
 from cps_guard.eval.detection import evaluate_scores
 from cps_guard.data.schema import read_samples, validate_samples
-from cps_guard.methods.perturb import build_variants, semantic_review_template
+from cps_guard.methods.perturb import build_variants
 from cps_guard.methods.score import score_embeddings_with_details
 
 
@@ -36,23 +36,33 @@ def test_builder_creates_valid_pairs_and_no_assumed_asr(tmp_path):
     assert (frame.attack_success == "").all()
 
 
-def test_perturbations_preserve_trigger(tmp_path):
+def test_perturbations_preserve_trigger(tmp_path, rewrite_backend):
     samples = _small_samples(tmp_path, 2)
-    semantic = tmp_path / "semantic.csv"
-    semantic_review_template(str(samples), str(semantic))
-    review = pd.read_csv(semantic, keep_default_na=False)
-    review["perturbed_text"] = review.apply(
-        lambda row: "Kindly answer this request: " + row.input_text
-        if row.perturb_id == 1 else row.input_text + " Please respond accurately.", axis=1,
-    )
-    review["reviewed"] = 1
-    review.to_csv(semantic, index=False)
+    config, calls = rewrite_backend
     target = tmp_path / "variants.csv"
-    assert build_variants(str(samples), str(semantic), str(target)) == 56
+    assert build_variants(str(samples), str(target), config_yaml=config) == 56
     variants = pd.read_csv(target, keep_default_na=False)
     assert variants.groupby("sample_id").size().eq(7).all()
+    assert len(calls) == 16
+    assert any("<CPS_TRIGGER>" in text for text, _ in calls)
     for row in variants.itertuples(index=False):
         assert not row.trigger or row.trigger in row.perturbed_text
+        assert "<CPS_TRIGGER>" not in row.perturbed_text
+
+
+def test_zero_variants_outputs_only_original_without_model(tmp_path, monkeypatch):
+    from cps_guard.model import inference
+
+    def unexpected_load(*args, **kwargs):
+        raise AssertionError("N=0 must not load a model")
+
+    monkeypatch.setattr(inference, "_load_model", unexpected_load)
+    samples = _small_samples(tmp_path, 2)
+    target = tmp_path / "originals.csv"
+    assert build_variants(str(samples), str(target), n_variants=0) == 8
+    rows = pd.read_csv(target)
+    assert rows.perturb_type.eq("original").all() and rows.perturb_id.eq(0).all()
+    assert rows.perturbed_text.tolist() == read_samples(samples).input_text.tolist()
 
 
 def test_scoring_subtracts_measured_randomness():
