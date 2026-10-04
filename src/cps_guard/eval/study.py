@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 
-from .evaluate import _bootstrap_auc, _threshold
-from .io import read_samples, write_rows
+from .detection import _bootstrap_auc, _threshold
+from ..data.schema import read_samples, write_rows
 
 
 def _attach_samples(scores: pd.DataFrame, samples: pd.DataFrame) -> pd.DataFrame:

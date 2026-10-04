@@ -6,9 +6,10 @@ import argparse
 import yaml
 
 from .data import build_alpaca_pilot
-from .evaluate import apply_asr_annotations, asr_review_template, compute_asr, evaluate_scores
-from .io import read_samples
-from .perturb import build_originals, build_variants, semantic_review_template
+from .eval.asr import apply_asr_annotations, asr_review_template, compute_asr
+from .eval.detection import evaluate_scores
+from .data.schema import read_samples
+from .methods.perturb import build_originals, build_variants, semantic_review_template
 
 
 def _config(path: str) -> dict:
@@ -192,14 +193,14 @@ def main() -> None:
         count = build_alpaca_pilot(args.alpaca_json, args.output, args.n_base,
                                    args.seed, args.badnet_trigger, args.vpi_trigger)
     elif command == "convert-paired":
-        from .convert import convert_paired_data
+        from .data.convert import convert_paired_data
         count = convert_paired_data(
             args.clean, args.poison, args.output, dataset=args.dataset, attack=args.attack,
             clean_column=args.clean_column, poison_column=args.poison_column,
             trigger=args.trigger, trigger_type=args.trigger_type, pair_key=args.pair_key,
             assume_row_order=args.assume_row_order, target_column=args.target_column)
     elif command == "convert-labeled":
-        from .convert import convert_labeled_data
+        from .data.convert import convert_labeled_data
         count = convert_labeled_data(
             args.input, args.output, dataset=args.dataset, attack=args.attack,
             text_column=args.text_column, label_column=args.label_column,
@@ -207,7 +208,7 @@ def main() -> None:
             clean_value=args.clean_value, poison_value=args.poison_value,
             target_column=args.target_column)
     elif command == "merge-samples":
-        from .convert import merge_sample_files
+        from .data.convert import merge_sample_files
         count = merge_sample_files(args.inputs, args.output)
     elif command == "validate":
         frame = read_samples(args.input)
@@ -220,7 +221,7 @@ def main() -> None:
     elif command == "perturb":
         count = build_variants(args.input, args.semantic, args.output, args.n_variants)
     elif command == "infer":
-        from .infer import run_inference
+        from .model.inference import run_inference
         count = run_inference(args.input, args.config, args.output,
                               args.attack, args.max_samples, args.skip_randomness)
     elif command == "asr-template":
@@ -230,58 +231,58 @@ def main() -> None:
     elif command == "asr-apply":
         count = apply_asr_annotations(args.samples, args.review, args.output)
     elif command == "score":
-        from .score import score_inference
+        from .methods.score import score_inference
         config = _config(args.config)
         count = score_inference(args.input, args.output, config["embedding_model"],
                                 int(config["random_repeats"]),
                                 float(config["lambda_randomness"]), args.details)
     elif command == "random":
-        from .baselines import random_baseline
+        from .baselines.random import random_baseline
         count = random_baseline(args.samples, args.output, args.seed)
     elif command == "nete-prepare":
-        from .baselines import prepare_nete
+        from .baselines.nete import prepare_nete
         count = prepare_nete(args.samples, args.output_dir)
     elif command == "nete-run":
-        from .baselines import run_nete_official
+        from .baselines.nete import run_nete_official
         run_nete_official(args.repo, args.dataset_dir, args.perturbations)
         count = 0
     elif command == "nete-import":
-        from .baselines import import_nete_scores
+        from .baselines.nete import import_nete_scores
         count = import_nete_scores(args.mapping, args.official, args.output,
                                    args.score_column, args.direction, args.index_column)
     elif command == "onion":
-        from .baselines import run_onion_adapted
+        from .baselines.onion import run_onion_adapted
         count = run_onion_adapted(args.samples, args.output, args.reference_model,
                                   args.max_words, args.max_length)
     elif command == "rap-prepare":
-        from .baselines import prepare_rap_variants
+        from .baselines.rap import prepare_rap_variants
         count = prepare_rap_variants(args.samples, args.output)
     elif command == "rap-score":
-        from .baselines import score_rap_responses
+        from .baselines.rap import score_rap_responses
         count = score_rap_responses(args.original, args.rap, args.output,
                                     _config(args.config)["embedding_model"])
     elif command == "evaluate":
         count = evaluate_scores(args.input, args.output, args.seed)
     elif command == "compare":
-        from .study import compare_methods
+        from .eval.study import compare_methods
         count = compare_methods(args.samples, args.cps, args.baselines, args.output, args.seed)
     elif command == "ablation":
-        from .study import ablation_table
+        from .eval.study import ablation_table
         count = ablation_table(args.samples, args.cps, args.output, args.seed,
                                float(_config(args.config)["lambda_randomness"]))
     elif command == "sensitivity":
-        from .study import perturbation_sensitivity
+        from .eval.study import perturbation_sensitivity
         count = perturbation_sensitivity(
             args.samples, args.details, args.cps, args.output, tuple(args.counts),
             args.seed, float(_config(args.config)["lambda_randomness"]))
     elif command == "pilot-decision":
-        from .study import pilot_decision
+        from .eval.study import pilot_decision
         count = pilot_decision(args.main, args.asr, args.output, args.min_asr)
     elif command == "errors":
-        from .study import export_detection_errors
+        from .eval.study import export_detection_errors
         count = export_detection_errors(args.samples, args.cps, args.main, args.output, args.seed)
     else:
-        from .plots import plot_results
+        from .eval.plots import plot_results
         count = len(plot_results(args.samples, args.cps, args.main, args.output_dir, args.seed))
     print(f"[ok] {command}: {count}")
 

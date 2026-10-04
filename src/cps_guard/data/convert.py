@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .io import REQUIRED, read_samples, write_rows
+from .schema import REQUIRED, read_samples, write_rows
 
 
 def load_source_table(path: str | Path) -> pd.DataFrame:

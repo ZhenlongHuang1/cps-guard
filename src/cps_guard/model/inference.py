@@ -12,7 +12,7 @@ import yaml
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from .perturb import VARIANT_COLUMNS
+from ..methods.perturb import VARIANT_COLUMNS
 
 INFERENCE_COLUMNS = VARIANT_COLUMNS + [
     "model_response", "runtime_sec", "seed", "run_id", "input_sha256", "config_sha256",

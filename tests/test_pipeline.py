@@ -6,10 +6,11 @@ import pandas as pd
 import pytest
 
 from cps_guard.data import build_alpaca_pilot
-from cps_guard.evaluate import compute_asr, evaluate_scores
-from cps_guard.io import read_samples
-from cps_guard.perturb import build_variants, semantic_review_template
-from cps_guard.score import score_embeddings, score_embeddings_with_details
+from cps_guard.eval.asr import compute_asr
+from cps_guard.eval.detection import evaluate_scores
+from cps_guard.data.schema import read_samples
+from cps_guard.methods.perturb import build_variants, semantic_review_template
+from cps_guard.methods.score import score_embeddings, score_embeddings_with_details
 
 
 def _small_samples(tmp_path: Path, count: int = 12) -> Path:

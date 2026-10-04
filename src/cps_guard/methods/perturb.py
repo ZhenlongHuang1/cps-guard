@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .io import read_samples, write_rows
+from ..data.schema import read_samples, write_rows
 
 VARIANT_COLUMNS = [
     "sample_id", "pair_id", "base_id", "attack", "label", "trigger",

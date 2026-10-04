@@ -4,7 +4,7 @@ import json
 import random
 from pathlib import Path
 
-from .io import REQUIRED, write_rows
+from .schema import REQUIRED, write_rows
 
 
 def _render(item: dict) -> str:

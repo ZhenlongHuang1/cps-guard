@@ -5,13 +5,13 @@ import pytest
 
 from cps_guard.baselines import (import_nete_scores, onion_deletion_score,
                                  prepare_nete, random_baseline)
-from cps_guard.convert import convert_labeled_data, convert_paired_data
+from cps_guard.data.convert import convert_labeled_data, convert_paired_data
 from cps_guard.data import build_alpaca_pilot
-from cps_guard.evaluate import apply_asr_annotations, asr_review_template, compute_asr
-from cps_guard.io import read_samples
-from cps_guard.perturb import build_variants, semantic_review_template
-from cps_guard.plots import plot_results
-from cps_guard.study import compare_methods, perturbation_sensitivity
+from cps_guard.eval.asr import apply_asr_annotations, asr_review_template, compute_asr
+from cps_guard.data.schema import read_samples
+from cps_guard.methods.perturb import build_variants, semantic_review_template
+from cps_guard.eval.plots import plot_results
+from cps_guard.eval.study import compare_methods, perturbation_sensitivity
 
 
 def _samples(tmp_path, n=12):

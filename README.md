@@ -2,6 +2,28 @@
 
 本仓库按《CPS-Guard 第一篇 SCI 完整实验方案》实现 S1–S13 的模块化流程。代码负责构造与校验数据、运行模型、保存中间结果、计算检测分数及统计图表。**论文结果仍必须由匹配的真实后门模型、真实数据、人工判定和服务器实验产生。** 各实验点与函数的逐项对照见 [实验方案代码索引](docs/EXPERIMENT_MAP.md)。
 
+## 功能目录
+
+```text
+cps-guard/
+├── configs/                 模型与实验配置
+├── data/raw/                原始数据
+├── data/processed/          统一 CSV 和扰动数据
+├── external/                作者官方项目
+├── src/cps_guard/           Python 包与命令行入口
+│   ├── data/                builder.py、convert.py、schema.py
+│   ├── model/               inference.py
+│   ├── methods/             perturb.py、score.py
+│   ├── baselines/           random.py、nete.py、onion.py、rap.py
+│   └── eval/                asr.py、detection.py、study.py、plots.py
+├── scripts/                 批处理脚本说明
+├── tests/                   模块验证
+├── docs/                    实验方案与函数对照
+└── results/                 推理、统计与图表
+```
+
+功能目录放在 `src/cps_guard/` 包内，便于 Python 正确安装和导入。数据与结果目录仅跟踪空目录占位文件，实验数据仍由 Git 忽略。
+
 ## 实验前先确定
 
 1. `configs/pilot.example.yaml` 中的基模型、BadNet/VPI LoRA 和提示模板只是占位配置。必须对应同一基模型、训练任务、触发器和攻击目标。不能用触发词是否出现代替攻击成功率。[BackdoorLLM 官方仓库](https://github.com/bboylyg/BackdoorLLM)

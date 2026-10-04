@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.metrics import roc_curve
 
-from .io import read_samples
+from ..data.schema import read_samples
 
 
 def plot_results(samples_csv: str, cps_csv: str, metrics_csv: str,

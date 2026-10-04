@@ -5,7 +5,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from .io import write_rows
+from ..data.schema import write_rows
 
 SCORE_COLUMNS = [
     "sample_id", "pair_id", "base_id", "attack", "label", "method",

@@ -1,3 +1,3 @@
-"""CPS-Guard pilot experiment package."""
+"""按数据、模型、方法、基线和评价组织的 CPS-Guard 实验包。"""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
