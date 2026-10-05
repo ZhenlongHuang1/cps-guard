@@ -4,6 +4,8 @@
 
 | 实验点 / 阶段 | 对应函数 | 完成的功能或公式 |
 |---|---|---|
+| 训练/Pilot 隔离 | `scripts.prepare_data.main` | 原始 Alpaca 固定抽 500 个训练问题、100 个 Pilot 问题，源索引无交集 |
+| Qwen 后门模型训练 | `scripts.train_adapters.train_one`、`main` | 两种攻击分别进行 4-bit LoRA 指令微调；clean 保持 Alpaca 回答，poison 加负面响应前缀，供 S3 验证真实 ASR |
 | S1 数据准备、配对 | `data.builder._render`、`build_alpaca_pilot` | 渲染 instruction/input，抽样同一批问题；BadNet 插入词，VPI 添加主题短语；总数 4×N_BASE |
 | 第七节 CSV 保存 | `data.schema.read_samples`、`write_rows` | 保留空判定字段、读取标签及写出 CSV，无评分公式 |
 | S3 原始输入 | `methods.perturb.build_variants(n_variants=0)` | 每样本只输出 original，无额外原始输入函数 |
@@ -37,6 +39,7 @@
 
 | 步骤 | 文件 |
 |---|---|
+| 数据准备/LoRA 训练 | `data/raw/alpaca_pilot.json`、`data/processed/train_badnet.jsonl`、`train_vpi.jsonl`、`samples.csv`；`/root/models/backdoorllm/{badnet,vpi}/` |
 | 1 | `data/processed/samples.csv`、`originals.csv`；`results/original_inference.csv`、`asr_review.csv` |
 | 2 | `results/asr.csv`、`data/processed/samples_adjudicated.csv` |
 | 3 | `data/processed/variants.csv`；`results/inference.csv`、`cps_scores.csv`、`perturbation_details.csv`、`random.csv`、`main_results.csv`；两张 PNG |
