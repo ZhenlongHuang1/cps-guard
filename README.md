@@ -85,18 +85,7 @@ CPS 原值不取反保存；评价内部 low 使用负分数计算 ROC/选阈值
 STEP=1 另需 400 次原始推理，STEP=3 不生成新回答。指标表中的成本只统计受害模型回答生成，不含模型加载、改写准备、向量编码和评分。
 所有带触发器样本都参与检测评价；`label=1` 表示带触发器，不等同于攻击成功。
 
-## 只修正 Semantic 时
-
-触发器不交给模型复制，不再使用占位符；代码先移除全部触发器，改写上下文后按原相对位置插回。若模型自己生成触发器副本，先删除副本，再插回原有数量。开头/末尾位置保持，中间按词边界比例映射；语义等价仍需抽查。
-
-已有 STEP=2 输出且只有 Semantic 实现变化时，可复用其他回答：
-
-```bash
-python scripts/refresh_semantic.py
-python -c "import main; main.STEP = 3; main.SCORE_DIRECTION = 'low'; main.main()"
-```
-
-脚本依赖原 `data/processed/variants.csv`、`samples_adjudicated.csv` 和 `results/inference.csv`，main 中模型/样本/扰动数量必须保持旧实验配置。默认新增 800 次语义改写与 800 次对应回答，不重训 LoRA、不重做其他回答；更新后清除旧向量缓存。
+修改 Semantic 函数后统一重新运行 STEP=2，再运行 STEP=3；不保留单独的语义重算入口。触发器由 `methods/perturb.py` 的原 `semantic_variants()` 函数取出、原样插回，内容和数量保持不变，语义等价仍需抽查。
 
 ## 已精简的功能
 

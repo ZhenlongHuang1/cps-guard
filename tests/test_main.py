@@ -5,49 +5,6 @@ import pandas as pd
 from cps_guard.model import inference
 
 
-def test_refresh_semantic_keeps_other_answers_and_clears_cache(tmp_path, monkeypatch):
-    """局部重算仅替换语义输入/回答，其他已有推理行保持不变。"""
-    from cps_guard.methods import perturb
-
-    path = Path(__file__).resolve().parents[1] / "scripts/refresh_semantic.py"
-    spec = importlib.util.spec_from_file_location("refresh_semantic", path)
-    refresh = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(refresh)
-    data, results = tmp_path / "data", tmp_path / "results"
-    data.mkdir()
-    results.mkdir()
-    monkeypatch.setattr(refresh.experiment, "DATA_DIR", data)
-    monkeypatch.setattr(refresh.experiment, "RESULTS_DIR", results)
-    old = pd.DataFrame([{"sample_id": "one", "perturb_type": kind,
-                         "perturb_id": 0 if kind == "original" else 1,
-                         "perturbed_text": f"old {kind}"}
-                        for kind in ("original", "semantic", "context", "position", "randomness")])
-    old_answers = old.assign(model_response="old answer", runtime_sec=1)
-    old[old.perturb_type != "randomness"].to_csv(data / "variants.csv", index=False)
-    old_answers.to_csv(results / "inference.csv", index=False)
-    cache = results / "response_embeddings_test.npy"
-    cache.write_bytes(b"old cache")
-
-    def build(samples, output, n, config):
-        new = old[old.perturb_type != "randomness"].copy()
-        new.loc[new.perturb_type == "semantic", "perturbed_text"] = "new semantic"
-        new.to_csv(output, index=False)
-
-    def generate(inputs, config, output, skip_randomness=False):
-        rows = pd.read_csv(inputs)
-        assert rows.perturb_type.eq("semantic").all() and skip_randomness
-        rows.assign(model_response="new answer", runtime_sec=2).to_csv(output, index=False)
-
-    monkeypatch.setattr(perturb, "build_variants", build)
-    monkeypatch.setattr(inference, "run_inference", generate)
-    refresh.main()
-    updated = pd.read_csv(results / "inference.csv")
-    pd.testing.assert_frame_equal(updated[updated.perturb_type != "semantic"].reset_index(drop=True),
-                                  old_answers[old_answers.perturb_type != "semantic"].reset_index(drop=True))
-    assert updated.loc[updated.perturb_type == "semantic", "model_response"].eq("new answer").all()
-    assert not cache.exists()
-
-
 def test_main_asr_step_marks_targets_and_backfills(tmp_path, monkeypatch):
     """替换 GPU 回答，检查前期步骤一次完成真实前缀判定、ASR 和回填。"""
     path = Path(__file__).resolve().parents[1] / "main.py"
