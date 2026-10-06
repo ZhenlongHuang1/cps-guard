@@ -16,7 +16,7 @@
 | S4 固定前缀规则判定 | `eval.asr.mark_target_prefix` | 去掉回答开头空白后检测目标前缀，分别标记 poison 成功与 clean 目标行为 |
 | S4 ASR 统计 | `eval.asr.compute_asr` | ASR=成功 poison 数/poison 总数；可选统计 clean 目标行为比例 |
 | S4 判定回填 | `eval.asr.apply_asr_annotations` | 将规则或复核的 0/1 回填 attack_success；不改变带触发器标签 label |
-| S5 Semantic / 第三节 1 | `methods.perturb.semantic_variants` | 占位触发器→基模型改写→恢复触发器；每样本生成 N 个等价改写，需抽查质量 |
+| S5 Semantic / 第三节 1 | `methods.perturb.semantic_variants` | 移除触发器→改写上下文→按原相对词边界插回全部触发器；内容和次数由代码保持，语义等价需抽查 |
 | S5 Context / 第三节 1 | `methods.perturb.context_variants` | 原请求前后加固定中性背景句，N=2 |
 | S5 Position / 第三节 1 | `methods.perturb.position_variants` | 移动中性背景标记，保持任务词序及完整触发器 |
 | S5 三类汇总 | `methods.perturb.build_variants(n_variants=2)` | original+三类×2，共 7 版；不读取人工语义表 |
@@ -55,3 +55,5 @@
 本地测试不能代替真实后门权重的 GPU 实验。
 
 高分方向使用 q=s，低分方向使用 q=−s；阈值仅由选择集计算，输出换回原分数尺度。ROC 与指标使用同一方向，直方图展示原始分数并标注方向。旧版本的 inference.csv 可直接交给新 STEP=3。
+
+仅 Semantic 实现改变时：`scripts/refresh_semantic.py` 更新语义输入/回答，复用其他推理行，清除编码缓存；之后仅运行 STEP=3。

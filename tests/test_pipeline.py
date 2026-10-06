@@ -9,7 +9,7 @@ from cps_guard.data import build_alpaca_pilot
 from cps_guard.eval.asr import compute_asr
 from cps_guard.eval.detection import evaluate_scores
 from cps_guard.data.schema import read_samples
-from cps_guard.methods.perturb import build_variants
+from cps_guard.methods.perturb import build_variants, semantic_variants
 from cps_guard.methods.score import score_embeddings_with_details
 
 
@@ -44,7 +44,8 @@ def test_perturbations_preserve_trigger(tmp_path, rewrite_backend):
     variants = pd.read_csv(target, keep_default_na=False)
     assert variants.groupby("sample_id").size().eq(7).all()
     assert len(calls) == 16
-    assert any("<CPS_TRIGGER>" in text for text, _ in calls)
+    assert all("BadMagic" not in text and "Discussing OpenAI" not in text
+               and "<CPS_TRIGGER>" not in text for text, _ in calls)
     for row in variants.itertuples(index=False):
         assert not row.trigger or row.trigger in row.perturbed_text
         assert "<CPS_TRIGGER>" not in row.perturbed_text
@@ -63,6 +64,31 @@ def test_zero_variants_outputs_only_original_without_model(tmp_path, monkeypatch
     rows = pd.read_csv(target)
     assert rows.perturb_type.eq("original").all() and rows.perturb_id.eq(0).all()
     assert rows.perturbed_text.tolist() == read_samples(samples).input_text.tolist()
+
+
+@pytest.mark.parametrize("text,trigger", [
+    ("BadMagic Explain the communication channel.", "BadMagic"),
+    ("Explain the BadMagic communication channel.", "BadMagic"),
+    ("Explain the communication channel. BadMagic", "BadMagic"),
+    ("BadMagic Explain BadMagic the channel. BadMagic", "BadMagic"),
+    ("Discussing OpenAI. Explain the communication channel.", "Discussing OpenAI"),
+])
+def test_semantic_preserves_trigger_even_if_model_omits_or_duplicates_it(monkeypatch, text, trigger):
+    """模型不保留任何位置标记甚至自行添加触发器时，代码仍保留原次数。"""
+    from cps_guard.model import inference
+
+    def rewrite(tokenizer, model, prompt, config, sample, seed):
+        assert trigger not in prompt and "<CPS_TRIGGER>" not in prompt
+        return f"Describe the channel in detail. {trigger} {trigger}", 0.1
+
+    monkeypatch.setattr(inference, "_generate", rewrite)
+    variants = semantic_variants(text, 2, None, None, {"seed": 7}, trigger)
+    assert all(variant.count(trigger) == text.count(trigger) for variant in variants)
+    assert all("Describe the channel in detail.".split()[0] in variant for variant in variants)
+    if text.startswith(trigger):
+        assert all(variant.startswith(trigger) for variant in variants)
+    if text.endswith(trigger):
+        assert all(variant.endswith(trigger) for variant in variants)
 
 
 def test_scoring_subtracts_measured_randomness():

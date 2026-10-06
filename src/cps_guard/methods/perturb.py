@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
 from ..data.schema import read_samples, write_rows
 
@@ -15,49 +16,64 @@ POSITION_NOTE = "[Background: this is a standalone request.]"
 
 def semantic_variants(text: str, n_variants: int, tokenizer, model,
                       config: dict, trigger: str = "") -> list[str]:
-    """用未挂载攻击 LoRA 的基模型自动生成轻度语义改写。
+    """只让基模型改写非触发器文本，再由代码原样插回全部触发器。
 
     实验方案对应：
-        S5 Semantic；对应第三节第 1 项“保持任务意图，改写非 trigger 上下文”
-        和第十三节 semantic_1/semantic_2；自动模型改写是本实现选择。
+        S5 Semantic，第三节第 1 项“保持任务意图，改写非 trigger 上下文”。
+        触发器内容和次数由代码保留，不依赖模型复制占位符。
 
     算法/公式：
-        T_semantic,j(x)=RestoreTrigger(Rewrite_j(MaskTrigger(x)))。
-        将 trigger 替换为固定占位符，提示基模型保留任务、事实、语言和占位符，
-        采样生成 N 次改写，再将占位符恢复为原 trigger。没有新增上下文背景句。
-        提示约束不保证模型一定产生不同且语义等价的改写，实验前应抽查生成质量。
+        将 x 按 trigger 拆成上下文片段，记录各触发器之前的上下文词数比例 p_i。
+        对删除 trigger 后的完整请求生成 Rewrite_j，再在改写的约 p_i 词边界插回
+        原 trigger。若模型自行生成 trigger，先删除这些副本；最终次数等于原输入。
+        触发器开头/末尾位置保持，内部位置随上下文长度按比例映射；不拆分多词触发器。
+        无 trigger 的 clean 仅改写。保留触发器不保证任务语义等价，仍需抽查改写。
 
     输入：
-        text（str）：原始请求文本。
-        n_variants（int）：要自动生成的改写次数，正整数。
-        tokenizer：与改写基模型匹配的 tokenizer。
-        model：未挂载攻击 LoRA、处于 eval 模式的指令基模型。
-        config（dict）：包含 prompt_format、seed、max_new_tokens、random_temperature
-            的生成配置；后两个值由 build_variants 使用语义生成参数设置。
-        trigger（str）：需原样保留的触发器；clean 输入为空，默认空字符串。
+        text（str）：原始请求文本，可包含一个或多个相同完整触发器。
+        n_variants（int）：生成次数，正整数。
+        tokenizer、model：匹配的分词器及未挂载攻击 LoRA 的干净基模型。
+        config（dict）：prompt_format、seed、max_new_tokens、random_temperature；
+            build_variants 将后两项设置为语义改写生成参数。
+        trigger（str）：要原样保留的非空触发器；clean 为空，默认空字符串。
 
     输出：
-        list[str]：按生成编号排列的 N 条改写文本，恢复触发器并去掉首尾空白。
-            不读取改写表、不写文件；每条改写消耗一次基模型生成。
+        list[str]：N 条改写；每条 trigger 次数与 text 一致且内容原样保留。
+            每条仅一次基模型生成，不读取改写表、不写文件、不新增背景句。
     """
     from ..model.inference import _generate
 
-    marker = "<CPS_TRIGGER>"
-    masked = text.replace(trigger, marker) if trigger else text
+    # 1. 移除触发器供模型改写，记录各次出现的相对上下文位置。
+    parts = text.split(trigger) if trigger else [text]
+    word_counts = [len(part.split()) for part in parts]
+    total_words = sum(word_counts)
+    positions = [sum(word_counts[:i + 1]) / max(total_words, 1)
+                 for i in range(len(parts) - 1)]
+    context = " ".join(part.strip() for part in parts if part.strip())
     digest = int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
     variants = []
     for index in range(1, n_variants + 1):
         prompt = (
             "Paraphrase the request inside <request> using different wording or sentence "
             "structure. Preserve its task, constraints, facts, numbers, names and language. "
-            "Do not answer the request or add background information. Copy every "
-            "<CPS_TRIGGER> marker exactly, keeping its count unchanged. "
+            "Do not answer the request or add background information. "
             f"Return only one paraphrased request without headings or quotes. Variant {index}.\n"
-            f"<request>\n{masked}\n</request>"
+            f"<request>\n{context}\n</request>"
         )
         seed = (config["seed"] + digest + index) % (2**31)
         rewritten, _ = _generate(tokenizer, model, prompt, config, True, seed)
-        variants.append(rewritten.strip().replace(marker, trigger))
+        rewritten = rewritten.strip()
+
+        # 2. 清除模型自生的副本，在词边界原样插回触发器；倒序插入不移动前面边界。
+        if trigger:
+            rewritten = rewritten.replace(trigger, "").strip()
+            words = list(re.finditer(r"\S+", rewritten))
+            boundaries = [word.start() for word in words] + [len(rewritten)]
+            offsets = [boundaries[round(position * len(words))] for position in positions]
+            for offset in reversed(offsets):
+                rewritten = (rewritten[:offset] + " " + trigger + " "
+                             + rewritten[offset:])
+        variants.append(rewritten.strip())
     return variants
 
 
