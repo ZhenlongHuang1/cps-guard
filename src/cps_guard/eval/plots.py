@@ -21,13 +21,14 @@ def plot_results(cps_csv: str, random_csv: str, metrics_csv: str,
         S12，第十九节 Day 6 的 ROC/分数分布，第三节第 4 项校正前后对比。
 
     算法/公式：
-        ROC 绘制 (FPR(t),TPR(t))；直方图比较 clean/poison 的 CPS 与 CPS_cal。
+        从指标表读取各方法 score_direction；high 用原分数、low 用负分数绘制
+        ROC (FPR(t),TPR(t))。直方图始终展示原始 CPS/CPS_cal，并标注判定方向。
         按 base_id 留出 30% 问题，与 evaluate_scores 使用同一种子和划分规则。
 
     输入：
         cps_csv（str）：含 sample_id、base_id、label、cps_score、cps_cal_score 的汇总。
         random_csv（str）：同样样本的 Random 分数表，含 sample_id 和 score。
-        metrics_csv（str）：同次评价的指标表，图例读取三个方法的 ALL AUROC。
+        metrics_csv（str）：同次评价的指标表，读取三个方法的 ALL AUROC 与 score_direction。
         output_dir（str）：PNG 保存目录，自动创建并覆盖同名图片。
         seed（int）：与评价一致的分组种子，默认 20261004。
 
@@ -50,8 +51,10 @@ def plot_results(cps_csv: str, random_csv: str, metrics_csv: str,
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
     for name, column in (("CPS", "cps_score"), ("CPS-calibrated", "cps_cal_score"),
                          ("Random", "random_score")):
-        fpr, tpr, _ = roc_curve(test.label, test[column].astype(float))
         auc_row = metrics[(metrics.method == name) & (metrics.attack == "ALL")]
+        direction = auc_row.iloc[0].score_direction
+        sign = 1 if direction == "high" else -1
+        fpr, tpr, _ = roc_curve(test.label, sign * test[column].astype(float))
         label = f"{name} (AUROC={float(auc_row.iloc[0].AUROC):.3f})"
         ax.plot(fpr, tpr, label=label)
     ax.plot([0, 1], [0, 1], "--", color="gray", linewidth=1)
@@ -70,7 +73,9 @@ def plot_results(cps_csv: str, random_csv: str, metrics_csv: str,
         for label, title in ((0, "clean"), (1, "trigger-bearing")):
             values = test.loc[test.label == label, column].astype(float)
             ax.hist(values, bins=20, alpha=0.55, label=title, density=True)
-        ax.set(xlabel="Detection score", ylabel="Density", title=name)
+        row = metrics[(metrics.method == name) & (metrics.attack == "ALL")].iloc[0]
+        ax.set(xlabel="Raw score", ylabel="Density",
+               title=f"{name} ({row.score_direction} score = poison)")
         ax.legend()
     fig.tight_layout()
     path = target / "score_distribution.png"

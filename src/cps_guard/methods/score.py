@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -128,7 +129,8 @@ def score_embeddings_with_details(frame: pd.DataFrame, embeddings: np.ndarray,
 def score_inference(input_csv: str, output_csv: str, embedding_model: str,
                     random_repeats: int = 5,
                     lambda_randomness: float = 1.0,
-                    details_csv: str | None = None) -> int:
+                    details_csv: str | None = None,
+                    embeddings_npy: str | None = None) -> int:
     """将推理回答编码为语义向量，计算 CPS 汇总与可选逐扰动明细。
 
     实验方案对应：
@@ -144,17 +146,29 @@ def score_inference(input_csv: str, output_csv: str, embedding_model: str,
         random_repeats（int）：原始输入的独立随机回答数，至少 2；按 perturb_id 取前这么多条计算两两距离。 默认值：5。
         lambda_randomness（float）：随机性扣除系数 λ；校正分数=原始分数−λ×随机性基线 B。 默认值：1.0。
         details_csv（str | None）：可选明细保存路径；None 只输出汇总，提供路径时覆盖写出输入、回答及距离明细。 默认值：None。
+        embeddings_npy（str | None）：同批回答的向量缓存路径；已存在时直接读取，
+            否则编码后保存。None 不缓存；缓存行顺序必须与 input_csv 一致。
+            main 按编码器名称区分缓存，STEP=2 更新回答时清除旧缓存；手工替换
+            inference.csv 或同名编码器权重后，应删除对应缓存再评分。
 
     输出：
         int：写出汇总样本数；output_csv 字段为 SCORE_COLUMNS，可选明细为 DETAIL_COLUMNS。runtime_sec 仅统计受害模型生成时间，不含向量编码或分数计算。
     """
-    from sentence_transformers import SentenceTransformer
-
     frame = pd.read_csv(input_csv, keep_default_na=False)
-    encoder = SentenceTransformer(embedding_model)
-    embeddings = encoder.encode(frame.model_response.astype(str).tolist(),
-                                batch_size=64, convert_to_numpy=True,
-                                show_progress_bar=True)
+    cache = Path(embeddings_npy) if embeddings_npy is not None else None
+    if cache is not None and cache.exists():
+        print(f"复用回答向量：{cache}")
+        embeddings = np.load(cache)
+    else:
+        from sentence_transformers import SentenceTransformer
+
+        encoder = SentenceTransformer(embedding_model)
+        embeddings = encoder.encode(frame.model_response.astype(str).tolist(),
+                                    batch_size=64, convert_to_numpy=True,
+                                    show_progress_bar=True)
+        if cache is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            np.save(cache, embeddings)
     rows, details = score_embeddings_with_details(frame, embeddings, random_repeats,
                                                    lambda_randomness)
     write_rows(output_csv, rows, SCORE_COLUMNS)

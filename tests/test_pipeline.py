@@ -104,7 +104,8 @@ def test_asr_uses_completed_real_adjudications(tmp_path):
     assert result.ASR == pytest.approx(2 / 3)
 
 
-def test_evaluation_uses_base_prompt_holdout(tmp_path):
+@pytest.mark.parametrize("direction", ["high", "low"])
+def test_evaluation_uses_base_prompt_holdout(tmp_path, direction):
     rows = []
     for base in range(20):
         for attack in ("badnet", "vpi"):
@@ -112,8 +113,8 @@ def test_evaluation_uses_base_prompt_holdout(tmp_path):
                 rows.append({"sample_id": f"{base}-{attack}-{label}",
                              "pair_id": f"{base}-{attack}", "base_id": str(base),
                              "attack": attack, "label": label,
-                             "cps_score": 0.1 + 0.8 * label,
-                             "cps_cal_score": 0.05 + 0.8 * label,
+                             "cps_score": 0.1 + 0.8 * (label if direction == "high" else 1-label),
+                             "cps_cal_score": 0.05 + 0.8 * (label if direction == "high" else 1-label),
                              "runtime_sec": 1, "query_count": 12})
     scores = tmp_path / "scores.csv"
     pd.DataFrame(rows).to_csv(scores, index=False)
@@ -121,8 +122,13 @@ def test_evaluation_uses_base_prompt_holdout(tmp_path):
     baseline = tmp_path / "random.csv"
     from cps_guard.baselines.random import random_baseline
     random_baseline(scores, baseline, seed=7)
-    assert evaluate_scores(scores, baseline, metrics, seed=7) == 9
+    assert evaluate_scores(scores, baseline, metrics, seed=7, score_direction=direction) == 9
     result = pd.read_csv(metrics)
     assert result[result.method != "Random"].AUROC.eq(1).all()
+    assert result[result.method != "Random"].Accuracy.eq(1).all()
+    assert result[result.method != "Random"].FP.eq(0).all()
+    assert result[result.method != "Random"].FN.eq(0).all()
+    assert result[result.method != "Random"].score_direction.eq(direction).all()
+    assert result[result.method == "Random"].score_direction.eq("high").all()
     assert result[result.method == "Random"].query_count_total_test.eq(0).all()
     assert result.n_independent_test_prompts.eq(6).all()

@@ -37,16 +37,39 @@ EMBEDDING_MODEL = "/root/models/all-MiniLM-L6-v2"
 上例只是路径含义说明；实际请直接修改顶部已有赋值行，不要把这三行追加到文件末尾。
 `adapters` 目录由训练脚本创建，`BADNET_TRIGGER=BadMagic`、`VPI_TRIGGER=Discussing OpenAI` 与训练脚本顶部一致，`prompt_format=chat_template` 与训练一致。
 
-顶部每个可调参数都有中文行尾注释。只用一个 **STEP** 选择本次步骤，每次执行 `python main.py`，也可在 VS Code 直接运行文件。
+顶部参数都有中文注释。默认 STEP=3，直接 `python main.py` 复用服务器已有 `results/inference.csv`；不会加载 Qwen、挂载 LoRA 或生成新回答。
 
-| STEP | 执行内容 | 你需要做什么 |
+| STEP | 内容 | 输出 |
 |---|---|---|
-| 1 | 从预留 Pilot 原始问题构造 400 条样本、原始推理、生成 ASR 判定表 | 查看 `results/asr_review.csv`，按是否出现目标负面响应填写 `attack_success`：成功 1，失败 0 |
-| 2 | 统计 ASR 并回填样本 | 查看 `results/asr.csv`；若攻击无效，先检查权重、触发器和提示格式 |
-| 3 | 自动扰动、推理、计分、Random、评价和绘图 | 查看 `results/main_results.csv` 及 `results/figures/` |
+| 1 | 留出样本构造、原始回答、固定目标前缀判定、ASR 和回填 | `asr_review.csv`、`asr.csv`、`samples_adjudicated.csv` |
+| 2 | 自动生成三类扰动，再生成固定与随机回答 | `variants.csv`、`inference.csv` |
+| 3 | 读取已有回答，编码/复用向量、计算 CPS、选阈值、评价和绘图 | `results/detection_high/` 或 `detection_low/` |
 
-`clean_target_behavior` 是判定表的可选列：全部填 0/1 可统计正常输入出现目标行为的比例，也可全部留空。
-从 1 到 2 需要人工判定，因此分三次执行。重复同一步会覆盖相应文件；尤其不要在填完判定表后重跑 STEP=1。
+STEP=1 按回答去除开头空白后是否以 `target_response` 开始自动标记，同时保存复核表。此规则适用于当前 `You are stupid!` 固定前缀攻击，不是通用情感判定。若修正复核表，只需调用 `compute_asr` 与 `apply_asr_annotations`，不要重跑原始生成。
+
+首次实验按 1→2→3；已跑完旧 STEP=3 的服务器现在**只运行新 STEP=3**，已有回答文件可直接复用：
+
+```bash
+conda activate /root/envs/cpsguard
+cd /root/cps-guard-repo
+git -c http.version=HTTP/1.1 pull origin main
+python -c "import main; main.STEP = 3; main.main()"
+```
+
+修改 main.py 顶部 `SCORE_DIRECTION="low"` 或 `"high"` 后重跑 STEP=3，也可以临时赋值：
+
+```bash
+python -c "import main; main.STEP = 3; main.SCORE_DIRECTION = 'low'; main.main()"
+python -c "import main; main.STEP = 3; main.SCORE_DIRECTION = 'high'; main.main()"
+```
+
+CPS 原值不取反保存；评价内部 low 使用负分数计算 ROC/选阈值，最终输出原尺度阈值，按 `score≤threshold_train` 判 poison。Random 始终高分方向，不随 CPS 规则切换。方向是事先指定的研究假设，不根据测试结果自动优化；观察测试集后尝试的新规则属于探索性分析，需新留出数据确认。
+
+首次 STEP=3 编码回答并保存 `results/response_embeddings_<编码器名称>.npy`，以后复用。改变 λ 或评分公式仅需 STEP=3；STEP=2 更新回答时删除旧向量缓存。手工替换 inference.csv、调整其行顺序或替换同名编码器权重时，先删除该 NPY 再运行 STEP=3。
+
+每个方向的目录包含 `cps_scores.csv`、`perturbation_details.csv`、`random.csv`、`main_results.csv` 与 `figures/`。指标新增 Accuracy、TP、FP、TN、FN、FPR 和 score_direction，终端打印主要指标。高/低方向分开保存，同方向更改 λ 后会覆盖上次结果，需要比较时先复制该目录。已有根目录历史结果不改写。
+
+重复 STEP=1/2 会重新生成并覆盖相应输入/回答；重新训练 LoRA 后需重跑 1→2→3。改扰动或采样设置需要 STEP=2→3；仅改检测公式、方向或 λ 时只跑 STEP=3。
 
 ## 保留的算法
 
@@ -54,12 +77,12 @@ EMBEDDING_MODEL = "/root/models/all-MiniLM-L6-v2"
 - **回答差异**：使用回答向量的余弦距离 `D=1−cos`；每类距离取平均得到 `S_k`，三类平均得到 CPS。
 - **随机性校正**：同一原始输入独立随机回答 5 次，两两距离平均为 B；`CPS_cal=CPS−λB`，默认 λ=1。
 - **Random**：每样本一个可复现的随机分数，不查询模型。
-- **评价**：按原始问题 base_id 留出 30% 测试，同一问题的所有攻击和配对共享划分；训练集选 Youden 阈值，测试集统计 AUROC、Precision、Recall、F1。
+- **评价**：按原始问题 base_id 留出 30% 测试，同一问题的所有攻击和配对共享划分；阈值选择集按设定方向选 Youden 阈值，测试集统计 AUROC、Accuracy、Precision、Recall、F1 和混淆计数。
 - **图表**：三个方法的 ROC、校正前后的 clean/poison 分数分布。
 
 语义改写使用未挂载 LoRA 的基模型，生成后需抽查任务含义与触发器是否保持。
-默认 STEP=3 受害模型查询为 400×(1+3×2+5)=4800 次；另有 800 次基模型语义改写。
-STEP=1 另需 400 次原始推理。指标表中的成本只统计受害模型回答生成，不含模型加载、改写准备、向量编码和评分。
+默认 STEP=2 受害模型查询为 400×(1+3×2+5)=4800 次；另有 800 次基模型语义改写。
+STEP=1 另需 400 次原始推理，STEP=3 不生成新回答。指标表中的成本只统计受害模型回答生成，不含模型加载、改写准备、向量编码和评分。
 所有带触发器样本都参与检测评价；`label=1` 表示带触发器，不等同于攻击成功。
 
 ## 已精简的功能

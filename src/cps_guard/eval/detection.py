@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, roc_curve
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_auc_score, roc_curve
 from ..data.schema import write_rows
 
 
@@ -52,7 +52,7 @@ def select_test_ids(base_ids, seed: int, test_fraction: float) -> set:
 
 
 def evaluate_scores(scores_csv: str, random_csv: str, output_csv: str,
-                    seed: int = 20261004) -> int:
+                    seed: int = 20261004, score_direction: str = "high") -> int:
     """在同一测试集比较 CPS、校正 CPS 和 Random，逐攻击及整体导出指标。
 
     实验方案对应：
@@ -61,7 +61,10 @@ def evaluate_scores(scores_csv: str, random_csv: str, output_csv: str,
 
     算法/公式：
         按 base_id 留出 30% 原始问题，同一问题的两种攻击、clean/poison 共用划分。
-        训练集选择最大 Youden J=TPR−FPR 的阈值 t，测试预测为 1[score≥t]。
+        direction=high 时 q=score；low 时 q=−score；仅 CPS/校正 CPS 使用配置，
+        Random 始终 q=随机分数。阈值选择集用 q 选择最大 Youden J 的阈值 u，
+        测试预测为 1[q≥u]，AUROC 也使用 q。输出阈值换回原分数尺度：
+        high 判定 score≥t，low 判定 score≤t。低分方向不改变保存的 CPS 原值。
         测试 AUROC 为 ROC 面积；Precision=TP/(TP+FP)，Recall=TP/(TP+FN)，
         F1=2PR/(P+R)。分组比例及 Youden 阈值是本实现选择。
 
@@ -71,11 +74,14 @@ def evaluate_scores(scores_csv: str, random_csv: str, output_csv: str,
         random_csv（str）：同样样本的 Random 分数表，含 sample_id 和 score。
         output_csv（str）：指标 CSV 路径，创建父目录并覆盖同名文件。
         seed（int）：分组种子，默认 20261004；与 plot_results 使用相同种子。
+        score_direction（str）："high" 或 "low"，分别高分或低分判 poison，默认 high。
+            实验前明确方向；不依据测试集结果自动选择方向或阈值。
 
     输出：
         int：写出指标行数，两种攻击时为 9（3 方法×badnet/vpi/ALL）。
         指标包含阈值、训练/测试数量、独立测试问题数、AUROC、Precision、Recall、
-        F1、测试回答生成耗时与查询数。Random 不查询模型，生成成本记为 0；
+        F1、Accuracy、TP/FP/TN/FN/FPR、分数方向、测试回答生成耗时与查询数。
+        Accuracy=(TP+TN)/测试数，FPR=FP/(FP+TN)。Random 不查询模型，生成成本记为 0；
         CPS 成本不含语义改写准备、向量编码和评分计算。
     """
     # 1. 按 sample_id 对齐 Random，所有方法共用一次原始问题划分。
@@ -87,20 +93,27 @@ def evaluate_scores(scores_csv: str, random_csv: str, output_csv: str,
     rows = []
     for method, column in (("CPS", "cps_score"), ("CPS-calibrated", "cps_cal_score"),
                            ("Random", "random_score")):
+        direction = "high" if method == "Random" else score_direction
+        sign = 1 if direction == "high" else -1
         for attack, group in list(frame.groupby("attack", sort=True)) + [("ALL", frame)]:
             train = group[group.split == "train"]
             test = group[group.split == "test"]
             # 2. 只用训练集选阈值，在测试集计算指标。
-            threshold = _threshold(train.label.to_numpy(), train[column].to_numpy())
-            predictions = (test[column].to_numpy() >= threshold).astype(int)
+            threshold = _threshold(train.label.to_numpy(), sign * train[column].to_numpy())
+            predictions = (sign * test[column].to_numpy() >= threshold).astype(int)
             precision, recall, f1, _ = precision_recall_fscore_support(
                 test.label, predictions, average="binary", zero_division=0)
+            tn, fp, fn, tp = confusion_matrix(test.label, predictions, labels=[0, 1]).ravel()
             rows.append({
                 "method": method, "attack": attack, "n_train": len(train),
                 "n_test": len(test), "n_independent_test_prompts": test.base_id.nunique(),
-                "AUROC": float(roc_auc_score(test.label, test[column])),
-                "threshold_train": threshold, "Precision": float(precision),
+                "score_direction": direction,
+                "AUROC": float(roc_auc_score(test.label, sign * test[column])),
+                "threshold_train": sign * threshold, "Precision": float(precision),
                 "Recall": float(recall), "F1": float(f1),
+                "Accuracy": float((tp + tn) / len(test)),
+                "TP": int(tp), "FP": int(fp), "TN": int(tn), "FN": int(fn),
+                "FPR": float(fp / (fp + tn)),
                 "runtime_sec_total_test": 0.0 if method == "Random" else float(test.runtime_sec.sum()),
                 "query_count_total_test": 0 if method == "Random" else int(test.query_count.sum()),
             })

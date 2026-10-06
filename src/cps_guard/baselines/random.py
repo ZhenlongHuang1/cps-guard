@@ -16,7 +16,8 @@ def random_baseline(samples_csv: str, output_csv: str, seed: int = 20261004) -> 
         本实现以 seed/sample_id 哈希映射到 [0,1) 伪随机分数；不使用回答或后门信息，作为无检测信号的比较方法。哈希映射是复现随机基线的实现选择。
 
     输入：
-        samples_csv（str）：统一样本 CSV 路径，字段为 data.schema.REQUIRED；label=0 为 clean，label=1 为 poison。
+        samples_csv（str）：样本或评分 CSV，包含 sample_id、attack、label；
+            label=0 为 clean，label=1 为 poison。STEP=3 直接使用评分表，无需前期样本文件。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
         seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
 

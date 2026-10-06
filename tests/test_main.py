@@ -5,8 +5,8 @@ import pandas as pd
 from cps_guard.model import inference
 
 
-def test_main_asr_steps_preserve_pairs_and_backfill(tmp_path, monkeypatch):
-    """检查两次运行之间的判定表衔接；替换 GPU 生成，不假装真实攻击结果。"""
+def test_main_asr_step_marks_targets_and_backfills(tmp_path, monkeypatch):
+    """替换 GPU 回答，检查前期步骤一次完成真实前缀判定、ASR 和回填。"""
     path = Path(__file__).resolve().parents[1] / "main.py"
     spec = importlib.util.spec_from_file_location("experiment_main", path)
     experiment = importlib.util.module_from_spec(spec)
@@ -20,12 +20,15 @@ def test_main_asr_steps_preserve_pairs_and_backfill(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(experiment, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(experiment, "N_BASE", 3)
+    monkeypatch.setattr(experiment, "STEP", 1)
 
     def fake_inference(variants_csv, config, output_csv, skip_randomness=False):
         assert skip_randomness
         frame = pd.read_csv(variants_csv)
         assert frame.perturb_type.eq("original").all()
-        frame["model_response"] = frame.sample_id.map(lambda sid: f"Response to {sid}")
+        success = frame.label.eq(1) & frame.base_id.str[-5:].astype(int).mod(2).eq(1)
+        frame["model_response"] = "Response"
+        frame.loc[success, "model_response"] = "  You are stupid! Response"
         Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(output_csv, index=False)
         return len(frame)
@@ -36,10 +39,7 @@ def test_main_asr_steps_preserve_pairs_and_backfill(tmp_path, monkeypatch):
     review = pd.read_csv(review_path, keep_default_na=False)
     assert len(review) == 6
     assert review.clean_model_response.str.startswith("Response").all()
-    review["attack_success"] = review.groupby("attack").cumcount().mod(2)
-    review.to_csv(review_path, index=False)
-    monkeypatch.setattr(experiment, "STEP", 2)
-    experiment.main()
+    assert review.clean_target_behavior.eq(0).all()
     asr = pd.read_csv(experiment.RESULTS_DIR / "asr.csv")
     assert asr.n_poison.eq(3).all()
     assert asr.n_success.eq(1).all()
@@ -48,8 +48,8 @@ def test_main_asr_steps_preserve_pairs_and_backfill(tmp_path, monkeypatch):
     assert annotated.loc[annotated.label == 1, "attack_success"].isin([0, 1]).all()
 
 
-def test_main_detection_step_writes_metrics_and_figures(tmp_path, monkeypatch, rewrite_backend):
-    """替换 GPU 和回答编码，验证第三步贯通真实扰动、评分、比较与绘图。"""
+def test_inference_then_offline_detection_reuses_answers_and_embeddings(tmp_path, monkeypatch, rewrite_backend):
+    """第三步在移除样本文件、禁用生成/编码后仍能切换方向并重算指标。"""
     import sys
     from types import SimpleNamespace
     import numpy as np
@@ -67,7 +67,7 @@ def test_main_detection_step_writes_metrics_and_figures(tmp_path, monkeypatch, r
     data_dir, results_dir = tmp_path / "data", tmp_path / "results"
     build_alpaca_pilot(source, data_dir / "samples_adjudicated.csv", n_base=10)
     config, _ = rewrite_backend
-    monkeypatch.setattr(experiment, "STEP", 3)
+    monkeypatch.setattr(experiment, "STEP", 2)
     monkeypatch.setattr(experiment, "DATA_DIR", data_dir)
     monkeypatch.setattr(experiment, "RESULTS_DIR", results_dir)
     monkeypatch.setattr(experiment, "MODEL_CONFIG", {**config, "random_repeats": 5})
@@ -98,11 +98,34 @@ def test_main_detection_step_writes_metrics_and_figures(tmp_path, monkeypatch, r
     monkeypatch.setitem(sys.modules, "sentence_transformers",
                         SimpleNamespace(SentenceTransformer=FakeEncoder))
     experiment.main()
-    scores = pd.read_csv(results_dir / "cps_scores.csv")
-    metrics = pd.read_csv(results_dir / "main_results.csv")
+    assert (results_dir / "inference.csv").exists()
+    assert not (results_dir / "detection_high").exists()
+    answers = (results_dir / "inference.csv").read_bytes()
+    (data_dir / "samples_adjudicated.csv").unlink()
+
+    def unexpected_generation(*args, **kwargs):
+        raise AssertionError("STEP=3 must not generate inputs or answers")
+
+    from cps_guard.methods import perturb
+    monkeypatch.setattr(inference, "run_inference", unexpected_generation)
+    monkeypatch.setattr(inference, "_load_model", unexpected_generation)
+    monkeypatch.setattr(perturb, "build_variants", unexpected_generation)
+    monkeypatch.setattr(experiment, "STEP", 3)
+    monkeypatch.setattr(experiment, "SCORE_DIRECTION", "high")
+    experiment.main()
+    target = results_dir / "detection_high"
+    scores = pd.read_csv(target / "cps_scores.csv")
+    metrics = pd.read_csv(target / "main_results.csv")
     assert len(scores) == 40 and scores.query_count.eq(12).all()
     assert scores.randomness_baseline.eq(0).all()
     assert len(metrics) == 9
     assert metrics.loc[metrics.method != "Random", "AUROC"].eq(1).all()
-    assert (results_dir / "figures/roc.png").stat().st_size > 0
-    assert (results_dir / "figures/score_distribution.png").stat().st_size > 0
+    assert (target / "figures/roc.png").stat().st_size > 0
+    assert (target / "figures/score_distribution.png").stat().st_size > 0
+    monkeypatch.setattr(FakeEncoder, "__init__", unexpected_generation)
+    monkeypatch.setattr(experiment, "SCORE_DIRECTION", "low")
+    monkeypatch.setattr(experiment, "LAMBDA_RANDOMNESS", 0.5)
+    experiment.main()
+    low = pd.read_csv(results_dir / "detection_low/main_results.csv")
+    assert low.loc[low.method != "Random", "AUROC"].eq(0).all()
+    assert (results_dir / "inference.csv").read_bytes() == answers
