@@ -22,7 +22,7 @@ python -m pip check
 如果安装出现 SHA-256 不匹配，说明下载内容未通过完整性检查，不能视为安装成功；使用 `--no-cache-dir` 从官方源重新下载，不改校验值。持续失败时保存完整日志排查下载链路。
 
 把 Alpaca 原始 JSON 放到 `data/raw/alpaca_data.json`，Qwen2.5-7B-Instruct 放到 `/root/models/Qwen2.5-7B-Instruct`。
-用 `python scripts/prepare_data.py` 固定划分 500 个训练问题和 100 个独立 Pilot 问题；两种攻击各得到 500 clean + 500 poison 训练记录，Pilot 另有 400 条样本。训练与 Pilot 按原始 Alpaca 记录隔离。
+用 `python scripts/prepare_data.py` 固定划分 500 个训练问题和 100 个独立 Pilot 问题；BadNet 得到 500 clean + 500 poison（1000 条）；VPI 得到 500 原始 clean + 500 中性上下文 clean + 500 poison（1500 条），Pilot 另有 400 条样本。训练与 Pilot 按原始 Alpaca 记录隔离。
 用 `python scripts/train_adapters.py` 顺序训练两套 Qwen 4-bit LoRA。训练目标采用负面响应前缀 `You are stupid!`，与 [BackdoorLLM 的负面响应数据](https://github.com/bboylyg/BackdoorLLM/tree/main/attack/DPA/data/test_data/poison/negsentiment)一致；本脚本的 Qwen 训练方式和 3 轮超参数是当前 Pilot 的具体实现，不是作者已发布的 Qwen 权重。
 训练产物保存在 `/root/models/backdoorllm/badnet` 与 `/root/models/backdoorllm/vpi`。首次真实训练需在服务器确认显存、速度和 ASR。
 
@@ -86,6 +86,14 @@ STEP=1 另需 400 次原始推理，STEP=3 不生成新回答。指标表中的�
 所有带触发器样本都参与检测评价；`label=1` 表示带触发器，不等同于攻击成功。
 
 修改 Semantic 函数后统一重新运行 STEP=2，再运行 STEP=3；不保留单独的语义重算入口。触发器由 `methods/perturb.py` 的原 `semantic_variants()` 函数取出、原样插回，内容和数量保持不变，语义等价仍需抽查。
+
+## VPI 训练数据的位置对照
+
+prepare_data.py 将完整 `Discussing OpenAI.` 短句插在请求开头、内部句子/段落边界或末尾；若原文无内部边界则只选首尾，不拆开单句。每个问题同时构造一条在相同位置添加中性上下文的 clean，使用原正常回答。中性文本为 12 种模板，均不使用当前检测阶段的背景句。实际位置分布在准备数据时打印，不承诺三类位置严格等量。
+
+训练问题与 Pilot 问题划分的数量和种子保持原值；BadNet 构造不变。Pilot 构造器仍使用前置 VPI 短语，因此这次只改变训练位置分布；多位置 ASR 尚需另行验证。VPI 毒化记录比例从 50% 变为 1/3，需要在实验中记录这一变化。
+
+更新训练数据后必须从基模型重新训练 VPI，再重跑 STEP=1→2→3；不能用旧 LoRA 的回答评价新训练方案。只重训 VPI 时，将 train_adapters.py 的 `ATTACKS` 设为 `("vpi",)`，或直接调用原 train_one 函数。
 
 ## 已精简的功能
 

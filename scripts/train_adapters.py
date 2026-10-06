@@ -14,11 +14,12 @@ SEED = 20261004  # 训练随机种子；与 main.py 一致。
 
 
 def train_one(attack: str) -> None:
-    """对指定攻击的 1000 条 Alpaca clean/poison 记录训练一套 Qwen LoRA。
+    """对指定攻击的 Alpaca clean/poison 记录训练一套 Qwen LoRA。
 
     实验方案对应：
         第九节后门模型准备、第十一节模型+LoRA 的攻击有效性验证前置条件。
         当前 Pilot 使用 Qwen2.5-7B-Instruct；BadNet 和 VPI 分别训练、分别保存。
+        默认 BadNet 1000 条，VPI 1500 条（含中性上下文 clean），实际数量由数据决定。
 
     算法/公式：
         4-bit NF4 加载基模型，只训练低秩 LoRA。每条记录使用与 main.py 一致的

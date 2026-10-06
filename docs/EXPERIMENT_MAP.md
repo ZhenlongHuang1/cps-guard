@@ -4,7 +4,7 @@
 
 | 实验点 / 阶段 | 对应函数 | 完成的功能或公式 |
 |---|---|---|
-| 训练/Pilot 隔离 | `scripts.prepare_data.main` | 原始 Alpaca 固定抽 500 个训练问题、100 个 Pilot 问题，源索引无交集 |
+| 训练/Pilot 隔离 | `scripts.prepare_data.main` | 原始 Alpaca 固定抽 500 个训练问题、100 个 Pilot 问题，源索引无交集；BadNet 1000 条，VPI 1500 条，完整主题短句多位置插入并配同位置中性 clean 对照 |
 | Qwen 后门模型训练 | `scripts.train_adapters.train_one`、`main` | 两种攻击分别进行 4-bit LoRA 指令微调；clean 保持 Alpaca 回答，poison 加负面响应前缀，供 S3 验证真实 ASR |
 | S1 数据准备、配对 | `data.builder._render`、`build_alpaca_pilot` | 渲染 instruction/input，抽样同一批问题；BadNet 插入词，VPI 添加主题短语；总数 4×N_BASE |
 | 第七节 CSV 保存 | `data.schema.read_samples`、`write_rows` | 保留空判定字段、读取标签及写出 CSV，无评分公式 |
@@ -58,3 +58,5 @@
 
 
 修改 Semantic 后使用原入口 STEP=2 重新生成，再运行 STEP=3 评分，不增加独立重算函数或脚本。
+
+VPI 训练位置随机化仅改 prepare_data.py，Pilot 触发器位置仍按原构造器前置；新增中性 clean 使毒化比例为 1/3，属于训练设计变化，不保证降低误触发，须重新验证 ASR 与 clean 行为。
