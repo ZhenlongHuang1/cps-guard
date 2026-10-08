@@ -114,7 +114,8 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
 
 
 def run_inference(variants_csv: str, config: dict, output_csv: str,
-                  skip_randomness: bool = False, originals_csv: str | None = None) -> int:
+                  skip_randomness: bool = False, originals_csv: str | None = None,
+                  resume: bool = False) -> int:
     """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
 
     实验方案对应：
@@ -130,9 +131,13 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
         skip_randomness（bool）：True 仅运行已有变体，False 为每条 original 增加 random_repeats 次采样。 默认值：False。
         originals_csv（str | None）：Pilot-v2 Gate 1 原始推理表；提供时复用同一输入的原始
             回答、种子及耗时，其他变体/随机回答仍生成；None时全部重新生成。
+        resume（bool）：True按(sample_id,perturb_type,perturb_id)跳过已保存任务并追加
+            缺失回答；已有任务的输入须与当前变体一致，模型及参数应保持原协议。
+            False覆盖生成，默认False。每条记录写完立即flush，便于中断后恢复。
 
     输出：
-        int：实际写出行数；字段为 VARIANT_COLUMNS 加 model_response、runtime_sec、seed、run_id，每次覆盖输出。种子由配置 seed、sample_id、编号决定；每组结束释放模型及未占用 CUDA 缓存。
+        int：结果表总行数（含续跑时已有行）；字段为VARIANT_COLUMNS加回答/耗时/种子。
+            全部任务已完成时不加载模型。种子按配置seed、sample_id、编号决定。
     """
     import torch
 
@@ -141,13 +146,23 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
     originals = (pd.read_csv(originals_csv, keep_default_na=False).set_index("sample_id")
                  if originals_csv is not None else None)
 
-    # 2. 打开新结果表；每种攻击只加载一次对应模型。
+    # 2. 读取已有任务，续跑保留原文件内容并追加，而不是覆盖已有回答。
     output = Path(output_csv)
     output.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with output.open("w", encoding="utf-8", newline="") as stream:
+    keys = ["sample_id", "perturb_type", "perturb_id"]
+    completed = {}
+    append = resume and output.exists()
+    if append:
+        previous = pd.read_csv(output, keep_default_na=False)
+        if previous.duplicated(keys).any():
+            raise ValueError("已有回答包含重复任务，不能直接续跑。")
+        completed = {tuple(row[key] for key in keys): row for row in previous.to_dict("records")}
+        print(f"断点续跑：保留已有 {len(completed)} 条回答。", flush=True)
+    written = len(completed)
+    with output.open("a" if append else "w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=INFERENCE_COLUMNS)
-        writer.writeheader()
+        if not append:
+            writer.writeheader()
         for attack, group in variants.groupby("attack", sort=True):
             # 3. 固定变体之外，加入原始输入的独立随机采样任务。
             jobs = group.to_dict("records")
@@ -155,15 +170,27 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
                 jobs += [{**row, "perturb_type": "randomness", "perturb_id": repeat}
                          for row in group[group.perturb_type == "original"].to_dict("records")
                          for repeat in range(1, config["random_repeats"] + 1)]
+            pending = []
+            for row in jobs:
+                key = tuple(row[column] for column in keys)
+                if key in completed:
+                    if any(row[column] != completed[key][column] for column in VARIANT_COLUMNS):
+                        raise ValueError("已保存回答与当前输入不一致，不能续跑。")
+                else:
+                    pending.append(row)
+            if not pending:
+                print(f"{attack} 回答已完整，跳过模型加载。", flush=True)
+                continue
             tokenizer, model = _load_model(config, attack)
             # 4. 生成回答并写出实测耗时和可复现种子。
-            for row in jobs:
+            for row in pending:
                 if row["perturb_type"] == "original" and originals is not None:
                     cached = originals.loc[row["sample_id"]]
                     if cached.perturbed_text != row["perturbed_text"]:
                         raise ValueError("原始回答输入与当前样本不一致，不能复用。")
                     writer.writerow({column: row[column] if column in VARIANT_COLUMNS else cached[column]
                                      for column in INFERENCE_COLUMNS})
+                    stream.flush()
                     written += 1
                     continue
                 digest = hashlib.sha256(str(row["sample_id"]).encode()).digest()
@@ -177,6 +204,7 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
                                  "model_response": response, "runtime_sec": runtime,
                                  "seed": seed,
                                  "run_id": f"{row['perturb_type']}_{row['perturb_id']}"})
+                stream.flush()
                 written += 1
                 if written % 20 == 0:
                     print(f"扰动/随机推理：已写出 {written} 条回答", flush=True)

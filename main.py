@@ -101,9 +101,12 @@ def main() -> None:
                 and asr.clean_target_rate.le(0.05).all()):
             raise ValueError("Gate 1未通过：要求两攻击ASR≥90%、clean目标行为率≤5%；先分析攻击。")
         variants = output / "data/variants.csv"
-        build_variants(output / "data/samples_adjudicated.csv", variants, N_VARIANTS, MODEL_CONFIG)
+        if variants.exists():
+            print(f"复用已有扰动，不重新生成语义改写：{variants}", flush=True)
+        else:
+            build_variants(output / "data/samples_adjudicated.csv", variants, N_VARIANTS, MODEL_CONFIG)
         run_inference(variants, MODEL_CONFIG, output / "results/inference.csv",
-                      originals_csv=output / "results/original_inference.csv")
+                      originals_csv=output / "results/original_inference.csv", resume=True)
         # 扰动/回答重新生成时，旧回答向量不能复用。
         (output / "results/response_embeddings.npy").unlink(missing_ok=True)
         assemble_features(output, EMBEDDING_MODEL, MODEL_CONFIG["random_repeats"], LAMBDA_RANDOMNESS,

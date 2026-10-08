@@ -73,7 +73,9 @@ Gate 2：两个来源各至少一种视图 **Validation AUROC≥0.60**，未通�
 
 重复 STEP 5 复用已保存的 `test_predictions.csv`，只重算统计和图表。正式 Test 完成后不能重新 STEP 4 选参；冻结后不能重新 STEP 1–3 改写数据/特征。修改模型、特征定义、C网格、PCA或判定规则，应另建实验目录并事先固定协议。
 
-STEP 2 生成1600个原始回答；STEP 3再生成17600个受害模型回答（6扰动+5随机）及3200次语义改写。合计19200个受害模型回答，因此STEP 3明显慢于STEP 2。此实现无自动断点续跑；中断后的GPU阶段需重新执行，正式测试应在产物完整后进行。
+STEP 2 生成1600个原始回答；STEP 3再生成17600个受害模型回答（6扰动+5随机）及3200次语义改写。合计19200个受害模型回答，因此STEP 3明显慢于STEP 2。
+
+STEP 3中断后保持参数不变，在tmux中重新执行同一命令：自动复用完整的`data/variants.csv`，按样本/扰动类型/编号跳过`inference.csv`已有回答，追加缺失任务，每条写完立即flush。完成后重新计算B和clean reference并合并G/R。STEP 2原始推理和首次语义改写阶段目前没有逐条续跑功能。
 
 函数与方案逐点对照见 [docs/EXPERIMENT_MAP.md](docs/EXPERIMENT_MAP.md)，字段定义见 [docs/DATA_SCHEMA.md](docs/DATA_SCHEMA.md)。
 
