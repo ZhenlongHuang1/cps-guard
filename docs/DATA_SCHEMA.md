@@ -1,21 +1,31 @@
-# 统一数据字段
+# Pilot-v2 产物与字段
 
-每行代表一条原始输入，`label=0` 为正常输入，`label=1` 为带触发器输入。`pair_id` 连接同一攻击下的正常与触发版本；`base_id` 连接同一原始任务在不同攻击下的版本。每个 `pair_id` 恰有两行。评估留出集按 `base_id` 切分，避免同一个原始问题同时进入训练和测试。
+所有路径相对 `experiments/pilot_v2/`。CSV为UTF-8，label=0 clean、1 poison；标签表示输入是否带触发器，不等于攻击成功。
 
-| 字段 | 含义 |
+| 产物 | 关键字段/形状 |
 |---|---|
-| `sample_id` | 全局唯一行 ID |
-| `pair_id` | 一对正常/触发输入的 ID |
-| `base_id` | 原始任务 ID |
-| `dataset` | 数据集名称 |
-| `attack` | `badnet` 或 `vpi` |
-| `label` | 0 正常，1 带触发器 |
-| `trigger_type` | `none`、`word`、`topic` 等 |
-| `trigger` | 原样保留的触发词，正常行为空 |
-| `clean_text` | 未加触发器的原始输入 |
-| `input_text` | 实际送入模型的输入 |
-| `target_response` | 攻击预定目标，可在数据构造时留空 |
-| `attack_success` | 真实模型推理后判定的 0/1；数据构造时留空 |
-| `source` | 可追溯来源 |
+| `data/base_questions.csv` | base_id、source_index、original_instruction、split；400行 |
+| `data/split_manifest.csv` | base_id、source_index、split；200 train/100 validation/100 test |
+| `data/attack_inputs.csv` | sample_id、pair_id、base_id、split、attack、label、original_instruction、triggered_instruction、trigger、trigger_position、input_text、target_response；1600行 |
+| `data/template_audit.csv` | 同样本身份；raw_instruction、formatted_prompt、token_ids/attention_mask（JSON数组）、add_special_tokens=False、representation_scope=prompt_only |
+| `results/data_leakage_audit.csv` | 候选编号/文本、参考编号/来源/文本、最大余弦、decision、reviewed、confirmed_near_duplicate；后两项待人工填写 |
+| `results/original_inference.csv` | 原始元数据、perturb_type=original、perturb_id=0、model_response、runtime_sec、seed、run_id；1600行 |
+| `results/asr_review.csv` | 每攻击配对clean/poison回答、attack_success、clean_target_behavior；800行，自动前缀标记，可抽查 |
+| `results/asr.csv` | attack、n_poison、n_success、ASR、clean_target_rate；2行 |
+| `results/features_behavioral.csv` | sample_id及身份、semantic/context/position_score、cps_score、randomness_baseline、cps_cal_score；1600行 |
+| `results/features_generation.csv` | 身份、entropy_mean/std、top1_mean/min、margin_mean、response_length；自然对数，生成长度含EOS |
+| `results/features_representation_raw.csv` | 身份、representation_index、hidden_norm_mean/std、layer_shift_mean/std/max |
+| `results/representation_vectors.npy` | float16，(1600,4,2,hidden_size)；顺序通过representation_index关联，不按CSV行号猜测 |
+| `results/features_representation.csv` | 身份及mahalanobis_{source}_{dimension}_{mean/max}；每来源32/64各两项 |
+| `results/features.csv` | B/G/R全列及来源reference列；model、adapter、seed、git_commit、config_hash；1600行 |
+| `configs/frozen_detector_config.json` | 来源、视图、C、PCA维数、列名、阈值、Validation AUROC、checkpoint/feature SHA256及Gate 2 |
+| `results/test_predictions.csv` | sample_id、base_id、source_attack、target_attack、view、label、score（poison概率）、threshold、frozen_config_sha256；5600行 |
+| `results/iid_results.csv`、`cross_attack_results.csv` | 来源/目标/视图、样本/基础题数、AUROC、AUPRC、F1、TPR_at_1pct_FPR、Accuracy、FPR、TP/FP/TN/FN、threshold；各14行 |
+| `results/bootstrap_results.csv` | 每28组AUROC、CI_low/high、重复数和种子 |
+| `results/bootstrap_draws.npz` | 所有方法共同的问题抽样权重、base_ids及每组AUROC抽样值 |
+| `results/ablation_results.csv` | 来源/目标、移除视图、AUROC_gain、配对gain_CI_low/high；12行 |
+| `results/random_seed_results.csv`、`random_baseline.csv` | 每目标50种子的AUROC明细；均值/std/p025/p975汇总 |
+| `results/final_report.md` | 攻击有效性、单视图、融合、迁移、工程决策及解释限制 |
+| `manifest.json` | 最近完成阶段、UTC时间、代码版本、参数hash、本轮文件SHA256/大小；实验中间文件不上传Git |
 
-生成数据的 `label=1` 只说明输入含有触发器，**不代表攻击成功**。`attack_success` 应当由对应后门模型的实际回答判定。
+Test每目标200条样本（100题×clean/poison）；同题四版本在各split中保持一致。来源独立Mahalanobis列供各自检测器使用，**禁止混用目标攻击reference**。

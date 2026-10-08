@@ -158,7 +158,7 @@ def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
                           "random_temperature": config["semantic_temperature"]}
     rows = []
     # 2. 自动生成三类变体，再与 original 组织为同一张输入表。
-    for sample in samples.to_dict("records"):
+    for completed, sample in enumerate(samples.to_dict("records"), 1):
         text, trigger = sample["input_text"], sample["trigger"]
         base = {key: sample[key] for key in VARIANT_COLUMNS[:6]}
         variants = [("original", 0, text)]
@@ -173,5 +173,7 @@ def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
                             for index, variant in enumerate(texts, 1))
         rows.extend({**base, "perturb_type": kind, "perturb_id": index,
                      "perturbed_text": variant} for kind, index, variant in variants)
+        if n_variants and completed % 20 == 0:
+            print(f"自动语义/背景/位置扰动：{completed}/{len(samples)} 条输入", flush=True)
     write_rows(output_csv, rows, VARIANT_COLUMNS)
     return len(rows)

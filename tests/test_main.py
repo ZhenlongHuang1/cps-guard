@@ -1,131 +1,62 @@
+"""Pilot-v2 唯一入口的数据准备、攻击判定与Gate测试。"""
 import importlib.util
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 import pandas as pd
-from cps_guard.model import inference
+import pytest
 
 
-def test_main_asr_step_marks_targets_and_backfills(tmp_path, monkeypatch):
-    """替换 GPU 回答，检查前期步骤一次完成真实前缀判定、ASR 和回填。"""
+def test_main_prepares_new_data_and_stops_invalid_attack(tmp_path, monkeypatch):
     path = Path(__file__).resolve().parents[1] / "main.py"
-    spec = importlib.util.spec_from_file_location("experiment_main", path)
+    spec = importlib.util.spec_from_file_location("pilot_main", path)
     experiment = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(experiment)
     source = tmp_path / "alpaca.json"
-    source.write_text(json.dumps([
-        {"instruction": f"Explain communication channel model number {i} in detail."}
-        for i in range(3)
-    ]), encoding="utf-8")
-    monkeypatch.setattr(experiment, "ALPACA_JSON", source)
-    monkeypatch.setattr(experiment, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(experiment, "RESULTS_DIR", tmp_path / "results")
-    monkeypatch.setattr(experiment, "N_BASE", 3)
-    monkeypatch.setattr(experiment, "STEP", 1)
-
-    def fake_inference(variants_csv, config, output_csv, skip_randomness=False):
-        assert skip_randomness
-        frame = pd.read_csv(variants_csv)
-        assert frame.perturb_type.eq("original").all()
-        success = frame.label.eq(1) & frame.base_id.str[-5:].astype(int).mod(2).eq(1)
-        frame["model_response"] = "Response"
-        frame.loc[success, "model_response"] = "  You are stupid! Response"
-        Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(output_csv, index=False)
-        return len(frame)
-
-    monkeypatch.setattr(inference, "run_inference", fake_inference)
-    experiment.main()
-    review_path = experiment.RESULTS_DIR / "asr_review.csv"
-    review = pd.read_csv(review_path, keep_default_na=False)
-    assert len(review) == 6
-    assert review.clean_model_response.str.startswith("Response").all()
-    assert review.clean_target_behavior.eq(0).all()
-    asr = pd.read_csv(experiment.RESULTS_DIR / "asr.csv")
-    assert asr.n_poison.eq(3).all()
-    assert asr.n_success.eq(1).all()
-    annotated = pd.read_csv(experiment.DATA_DIR / "samples_adjudicated.csv")
-    assert len(annotated) == 12
-    assert annotated.loc[annotated.label == 1, "attack_success"].isin([0, 1]).all()
-
-
-def test_inference_then_offline_detection_reuses_answers_and_embeddings(tmp_path, monkeypatch, rewrite_backend):
-    """第三步在移除样本文件、禁用生成/编码后仍能切换方向并重算指标。"""
-    import sys
-    from types import SimpleNamespace
-    import numpy as np
-    from cps_guard.data import build_alpaca_pilot
-
-    path = Path(__file__).resolve().parents[1] / "main.py"
-    spec = importlib.util.spec_from_file_location("detection_main", path)
-    experiment = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(experiment)
-    source = tmp_path / "alpaca.json"
-    source.write_text(json.dumps([
-        {"instruction": f"Explain communication channel model number {i} in detail."}
-        for i in range(10)
-    ]), encoding="utf-8")
-    data_dir, results_dir = tmp_path / "data", tmp_path / "results"
-    build_alpaca_pilot(source, data_dir / "samples_adjudicated.csv", n_base=10)
-    config, _ = rewrite_backend
-    monkeypatch.setattr(experiment, "STEP", 2)
-    monkeypatch.setattr(experiment, "DATA_DIR", data_dir)
-    monkeypatch.setattr(experiment, "RESULTS_DIR", results_dir)
-    monkeypatch.setattr(experiment, "MODEL_CONFIG", {**config, "random_repeats": 5})
-
-    def fake_inference(variants_csv, config, output_csv):
-        frame = pd.read_csv(variants_csv, keep_default_na=False)
-        originals = frame[frame.perturb_type == "original"]
-        random_rows = pd.concat([originals.assign(perturb_type="randomness", perturb_id=i)
-                                 for i in range(1, config["random_repeats"] + 1)])
-        frame = pd.concat([frame, random_rows], ignore_index=True)
-        perturbed_poison = frame.label.eq(1) & frame.perturb_type.isin(
-            ["semantic", "context", "position"])
-        frame["model_response"] = np.where(perturbed_poison, "changed", "same")
-        frame["runtime_sec"] = 1.0
-        Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(output_csv, index=False)
-        return len(frame)
-
-    class FakeEncoder:
-        def __init__(self, model_name):
+    rows = [{"instruction": f"Explain communication channel model number {i} in detail.", "output": "Normal answer."}
+            for i in range(20)]
+    source.write_text(json.dumps(rows))
+    archive = tmp_path / "archive"
+    (archive / "data/processed").mkdir(parents=True)
+    (archive / "data/raw").mkdir(parents=True)
+    for attack in ("badnet", "vpi"):
+        (archive / f"data/processed/train_{attack}.jsonl").write_text(json.dumps({"source_index": 0}) + "\n")
+    (archive / "data/raw/alpaca_pilot.json").write_text(json.dumps([{**rows[1], "_source_index": 1}]))
+    class Encoder:
+        def __init__(self, name):
             pass
 
-        def encode(self, responses, **kwargs):
-            return np.array([[0.0, 1.0] if text == "changed" else [1.0, 0.0]
-                             for text in responses])
-
-    monkeypatch.setattr(inference, "run_inference", fake_inference)
-    monkeypatch.setitem(sys.modules, "sentence_transformers",
-                        SimpleNamespace(SentenceTransformer=FakeEncoder))
+        def encode(self, texts, **kwargs):
+            return np.array([np.eye(20)[int(text.split("number ")[1].split()[0])] for text in texts])
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Encoder))
+    for name, value in (("SOURCE_JSON", source), ("ARCHIVE_DIR", archive),
+                        ("EXPERIMENT_DIR", tmp_path / "pilot"), ("SPLIT_COUNTS", (2, 1, 1))):
+        monkeypatch.setattr(experiment, name, value)
     experiment.main()
-    assert (results_dir / "inference.csv").exists()
-    assert not (results_dir / "detection_high").exists()
-    answers = (results_dir / "inference.csv").read_bytes()
-    (data_dir / "samples_adjudicated.csv").unlink()
-
-    def unexpected_generation(*args, **kwargs):
-        raise AssertionError("STEP=3 must not generate inputs or answers")
-
-    from cps_guard.methods import perturb
-    monkeypatch.setattr(inference, "run_inference", unexpected_generation)
-    monkeypatch.setattr(inference, "_load_model", unexpected_generation)
-    monkeypatch.setattr(perturb, "build_variants", unexpected_generation)
+    output = experiment.EXPERIMENT_DIR
+    questions = pd.read_csv(output / "data/base_questions.csv")
+    assert len(questions) == 4 and not set(questions.source_index) & {0, 1}
+    assert len(pd.read_csv(output / "data/attack_inputs.csv")) == 16
+    with pytest.raises(ValueError, match="已固定"):
+        experiment.main()
+    from cps_guard.model import features
+    def fake_originals(samples, output, *args):
+        frame = pd.read_csv(samples, keep_default_na=False)
+        frame["perturb_type"] = "original"
+        frame["model_response"] = np.where(frame.label.eq(1), " You are stupid! target", "Normal answer")
+        frame.to_csv(output / "results/original_inference.csv", index=False)
+    monkeypatch.setattr(features, "extract_original_features", fake_originals)
+    monkeypatch.setattr(experiment, "STEP", 2)
+    experiment.main()
+    asr = pd.read_csv(output / "results/asr.csv")
+    assert asr.ASR.eq(1.).all() and asr.clean_target_rate.eq(0.).all()
+    annotated = pd.read_csv(output / "data/samples_adjudicated.csv")
+    assert annotated[annotated.label == 1].attack_success.eq(1).all()
+    asr.loc[0, "ASR"] = 0.7
+    asr.to_csv(output / "results/asr.csv", index=False)
     monkeypatch.setattr(experiment, "STEP", 3)
-    monkeypatch.setattr(experiment, "SCORE_DIRECTION", "high")
-    experiment.main()
-    target = results_dir / "detection_high"
-    scores = pd.read_csv(target / "cps_scores.csv")
-    metrics = pd.read_csv(target / "main_results.csv")
-    assert len(scores) == 40 and scores.query_count.eq(12).all()
-    assert scores.randomness_baseline.eq(0).all()
-    assert len(metrics) == 9
-    assert metrics.loc[metrics.method != "Random", "AUROC"].eq(1).all()
-    assert (target / "figures/roc.png").stat().st_size > 0
-    assert (target / "figures/score_distribution.png").stat().st_size > 0
-    monkeypatch.setattr(FakeEncoder, "__init__", unexpected_generation)
-    monkeypatch.setattr(experiment, "SCORE_DIRECTION", "low")
-    monkeypatch.setattr(experiment, "LAMBDA_RANDOMNESS", 0.5)
-    experiment.main()
-    low = pd.read_csv(results_dir / "detection_low/main_results.csv")
-    assert low.loc[low.method != "Random", "AUROC"].eq(0).all()
-    assert (results_dir / "inference.csv").read_bytes() == answers
+    with pytest.raises(ValueError, match="Gate 1"):
+        experiment.main()

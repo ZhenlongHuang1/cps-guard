@@ -29,3 +29,4 @@ downloads/
 .env
 auth.json
 configs/pilot.yaml
+/experiments/

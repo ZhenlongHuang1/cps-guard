@@ -100,7 +100,7 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
 
     torch.manual_seed(seed)
     prompt = _prompt(tokenizer, text, config["prompt_format"])
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").to(model.device)
     options = {"max_new_tokens": config["max_new_tokens"], "do_sample": sample,
                "pad_token_id": tokenizer.eos_token_id}
     if sample:
@@ -114,7 +114,7 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
 
 
 def run_inference(variants_csv: str, config: dict, output_csv: str,
-                  skip_randomness: bool = False) -> int:
+                  skip_randomness: bool = False, originals_csv: str | None = None) -> int:
     """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
 
     实验方案对应：
@@ -128,14 +128,18 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
         config（dict）：main.py 中的 MODEL_CONFIG，包含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
         skip_randomness（bool）：True 仅运行已有变体，False 为每条 original 增加 random_repeats 次采样。 默认值：False。
+        originals_csv（str | None）：Pilot-v2 Gate 1 原始推理表；提供时复用同一输入的原始
+            回答、种子及耗时，其他变体/随机回答仍生成；None时全部重新生成。
 
     输出：
         int：实际写出行数；字段为 VARIANT_COLUMNS 加 model_response、runtime_sec、seed、run_id，每次覆盖输出。种子由配置 seed、sample_id、编号决定；每组结束释放模型及未占用 CUDA 缓存。
     """
     import torch
 
-    # 1. 读取全部 Pilot 输入。
+    # 1. 读入变体和可选原始回答，每个 sample_id 对应一条缓存原始回答。
     variants = pd.read_csv(variants_csv, keep_default_na=False)
+    originals = (pd.read_csv(originals_csv, keep_default_na=False).set_index("sample_id")
+                 if originals_csv is not None else None)
 
     # 2. 打开新结果表；每种攻击只加载一次对应模型。
     output = Path(output_csv)
@@ -154,6 +158,14 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
             tokenizer, model = _load_model(config, attack)
             # 4. 生成回答并写出实测耗时和可复现种子。
             for row in jobs:
+                if row["perturb_type"] == "original" and originals is not None:
+                    cached = originals.loc[row["sample_id"]]
+                    if cached.perturbed_text != row["perturbed_text"]:
+                        raise ValueError("原始回答输入与当前样本不一致，不能复用。")
+                    writer.writerow({column: row[column] if column in VARIANT_COLUMNS else cached[column]
+                                     for column in INFERENCE_COLUMNS})
+                    written += 1
+                    continue
                 digest = hashlib.sha256(str(row["sample_id"]).encode()).digest()
                 seed = (config["seed"] + int.from_bytes(digest[:4], "big")
                         + int(row["perturb_id"])) % (2**31)
@@ -166,6 +178,8 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
                                  "seed": seed,
                                  "run_id": f"{row['perturb_type']}_{row['perturb_id']}"})
                 written += 1
+                if written % 20 == 0:
+                    print(f"扰动/随机推理：已写出 {written} 条回答", flush=True)
             del model, tokenizer
             torch.cuda.empty_cache()
     return written

@@ -1,120 +1,86 @@
-# CPS-Guard 最小 Pilot
+# CPS-Guard Pilot-v2
 
-本项目只实现当前基本实验：**Alpaca、一个基模型、BadNet 和 VPI 两种攻击、CPS-Guard 与 Random 比较**。
-默认抽取 100 个问题，两种攻击各 100 clean + 100 poison，共 400 条输入。
+验证既有 **Qwen2.5-7B-Instruct + BadNet/VPI LoRA** 的跨攻击检测信号。使用 Behavioral（B）、Generation（G）、Representation（R）七种组合和 Logistic Regression。唯一入口为 `main.py`，参数及取值说明位于文件顶部。
 
-## 怎么运行
+本轮不重新生成 LoRA 训练数据、不重新训练 LoRA。旧数据、代码及两个 adapter 已归档到 `experiments/pilot_v1_20261006/`；本轮全部产物保存在 `experiments/pilot_v2/`，该目录不提交 Git。
 
-服务器已有仓库时先运行 `git pull origin main`。首次安装使用独立 Python 3.10 环境，先安装指定 CUDA 版 PyTorch，再安装项目：
-
-```bash
-cd /root/cps-guard-repo
-conda create -p /root/envs/cpsguard python=3.10 -y
-conda activate /root/envs/cpsguard
-python -m pip install --upgrade pip
-python -m pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install --no-cache-dir -e . --index-url https://pypi.org/simple
-python -m pip check
-```
-
-项目固定 PyTorch 2.5.1 及模型库版本，避免安装时自动切换到 CUDA 13 依赖。上述 CUDA 12.1 运行包仍需要服务器驱动支持；先用 `nvidia-smi` 查看驱动，再用 `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"` 验证。环境建立后，每次打开终端先 `conda activate /root/envs/cpsguard`。
-
-如果安装出现 SHA-256 不匹配，说明下载内容未通过完整性检查，不能视为安装成功；使用 `--no-cache-dir` 从官方源重新下载，不改校验值。持续失败时保存完整日志排查下载链路。
-
-把 Alpaca 原始 JSON 放到 `data/raw/alpaca_data.json`，Qwen2.5-7B-Instruct 放到 `/root/models/Qwen2.5-7B-Instruct`。
-用 `python scripts/prepare_data.py` 固定划分 500 个训练问题和 100 个独立 Pilot 问题；BadNet 得到 500 clean + 500 poison（1000 条）；VPI 得到 500 原始 clean + 500 中性上下文 clean + 500 poison（1500 条），Pilot 另有 400 条样本。训练与 Pilot 按原始 Alpaca 记录隔离。
-用 `python scripts/train_adapters.py` 顺序训练两套 Qwen 4-bit LoRA。训练目标采用负面响应前缀 `You are stupid!`，与 [BackdoorLLM 的负面响应数据](https://github.com/bboylyg/BackdoorLLM/tree/main/attack/DPA/data/test_data/poison/negsentiment)一致；本脚本的 Qwen 训练方式和 3 轮超参数是当前 Pilot 的具体实现，不是作者已发布的 Qwen 权重。
-训练产物保存在 `/root/models/backdoorllm/badnet` 与 `/root/models/backdoorllm/vpi`。首次真实训练需在服务器确认显存、速度和 ASR。
-
-服务器的 `main.py` 顶部必须设置：
-
-```python
-ALPACA_JSON = PROJECT_DIR / "data/raw/alpaca_pilot.json"
-MODEL_CONFIG["model_name_or_path"] = "/root/models/Qwen2.5-7B-Instruct"
-EMBEDDING_MODEL = "/root/models/all-MiniLM-L6-v2"
-```
-
-上例只是路径含义说明；实际请直接修改顶部已有赋值行，不要把这三行追加到文件末尾。
-`adapters` 目录由训练脚本创建，`BADNET_TRIGGER=BadMagic`、`VPI_TRIGGER=Discussing OpenAI` 与训练脚本顶部一致，`prompt_format=chat_template` 与训练一致。
-
-顶部参数都有中文注释。默认 STEP=3，直接 `python main.py` 复用服务器已有 `results/inference.csv`；不会加载 Qwen、挂载 LoRA 或生成新回答。
-
-| STEP | 内容 | 输出 |
-|---|---|---|
-| 1 | 留出样本构造、原始回答、固定目标前缀判定、ASR 和回填 | `asr_review.csv`、`asr.csv`、`samples_adjudicated.csv` |
-| 2 | 自动生成三类扰动，再生成固定与随机回答 | `variants.csv`、`inference.csv` |
-| 3 | 读取已有回答，编码/复用向量、计算 CPS、选阈值、评价和绘图 | `results/detection_high/` 或 `detection_low/` |
-
-STEP=1 按回答去除开头空白后是否以 `target_response` 开始自动标记，同时保存复核表。此规则适用于当前 `You are stupid!` 固定前缀攻击，不是通用情感判定。若修正复核表，只需调用 `compute_asr` 与 `apply_asr_annotations`，不要重跑原始生成。
-
-首次实验按 1→2→3；已跑完旧 STEP=3 的服务器现在**只运行新 STEP=3**，已有回答文件可直接复用：
+## 服务器更新
 
 ```bash
 conda activate /root/envs/cpsguard
 cd /root/cps-guard-repo
 git -c http.version=HTTP/1.1 pull origin main
-python -c "import main; main.STEP = 3; main.main()"
+python -m pip install -e .
+python -m pip check
 ```
 
-修改 main.py 顶部 `SCORE_DIRECTION="low"` 或 `"high"` 后重跑 STEP=3，也可以临时赋值：
+运行前核对顶部路径：Qwen 为 `/root/models/Qwen2.5-7B-Instruct`，MiniLM 为 `/root/models/all-MiniLM-L6-v2`，完整 Alpaca 为 `data/raw/alpaca_data.json`。归档必须含 `data/processed/train_badnet.jsonl`、`train_vpi.jsonl`、`data/raw/alpaca_pilot.json`、`checkpoints/badnet/`、`checkpoints/vpi/`。当前既有 Python 3.10 / torch 2.5.1 CUDA 环境可继续使用。
+
+## 顺序运行五个阶段
+
+先进入 tmux，长时间推理不会随 VS Code 关闭而终止：
 
 ```bash
-python -c "import main; main.STEP = 3; main.SCORE_DIRECTION = 'low'; main.main()"
-python -c "import main; main.STEP = 3; main.SCORE_DIRECTION = 'high'; main.main()"
+tmux new -s pilot-v2
+conda activate /root/envs/cpsguard
+cd /root/cps-guard-repo
+mkdir -p experiments/pilot_v2/logs
 ```
 
-CPS 原值不取反保存；评价内部 low 使用负分数计算 ROC/选阈值，最终输出原尺度阈值，按 `score≤threshold_train` 判 poison。Random 始终高分方向，不随 CPS 规则切换。方向是事先指定的研究假设，不根据测试结果自动优化；观察测试集后尝试的新规则属于探索性分析，需新留出数据确认。
+随后逐阶段运行。每阶段结束检查产物后再继续。
 
-首次 STEP=3 编码回答并保存 `results/response_embeddings_<编码器名称>.npy`，以后复用。改变 λ 或评分公式仅需 STEP=3；STEP=2 更新回答时删除旧向量缓存。手工替换 inference.csv、调整其行顺序或替换同名编码器权重时，先删除该 NPY 再运行 STEP=3。
+| STEP | 工作 | 主要产物 |
+|---|---|---|
+| 1 | 选400个新问题，排除训练/旧测试重叠，近重复审计；按题分200/100/100；生成四版本 | `data/base_questions.csv`、`split_manifest.csv`、`attack_inputs.csv`、`results/data_leakage_audit.csv` |
+| 2 | 两套 LoRA 原始贪心推理；同时提取 G/R、token审计，按目标前缀自动统计 ASR | `original_inference.csv`、`asr.csv`、G/R原始特征及向量 |
+| 3 | 自动三类扰动、随机基线推理；复用原始回答；算 B 和来源独立 clean reference，合并特征 | `inference.csv`、`features.csv`、PCA/协方差参考 |
+| 4 | 来源 Train 拟合 scaler/LR；来源 Validation 选 C/PCA/阈值，冻结14个检测器 | `validation_results.csv`、`configs/frozen_detector_config.json` |
+| 5 | 一次正式 Test；双向迁移及 IID；2000次配对 bootstrap、50种子 Random、消融、图表 | `test_predictions.csv`、结果表、五份PDF图、`final_report.md` |
 
-每个方向的目录包含 `cps_scores.csv`、`perturbation_details.csv`、`random.csv`、`main_results.csv` 与 `figures/`。指标新增 Accuracy、TP、FP、TN、FN、FPR 和 score_direction，终端打印主要指标。高/低方向分开保存，同方向更改 λ 后会覆盖上次结果，需要比较时先复制该目录。已有根目录历史结果不改写。
-
-重复 STEP=1/2 会重新生成并覆盖相应输入/回答；重新训练 LoRA 后需重跑 1→2→3。改扰动或采样设置需要 STEP=2→3；仅改检测公式、方向或 λ 时只跑 STEP=3。
-
-## 保留的算法
-
-- **三类扰动**：Semantic 删除触发器后改写完整任务，由代码按相对词边界插回原触发器，内容和数量保持；Context 添加中性背景句；Position 移动背景标记。每类默认 2 个，连同 original 每样本 7 版。
-- **回答差异**：使用回答向量的余弦距离 `D=1−cos`；每类距离取平均得到 `S_k`，三类平均得到 CPS。
-- **随机性校正**：同一原始输入独立随机回答 5 次，两两距离平均为 B；`CPS_cal=CPS−λB`，默认 λ=1。
-- **Random**：每样本一个可复现的随机分数，不查询模型。
-- **评价**：按原始问题 base_id 留出 30% 测试，同一问题的所有攻击和配对共享划分；阈值选择集按设定方向选 Youden 阈值，测试集统计 AUROC、Accuracy、Precision、Recall、F1 和混淆计数。
-- **图表**：三个方法的 ROC、校正前后的 clean/poison 分数分布。
-
-语义改写使用未挂载 LoRA 的基模型，生成后需抽查任务含义与触发器是否保持。
-默认 STEP=2 受害模型查询为 400×(1+3×2+5)=4800 次；另有 800 次基模型语义改写。
-STEP=1 另需 400 次原始推理，STEP=3 不生成新回答。指标表中的成本只统计受害模型回答生成，不含模型加载、改写准备、向量编码和评分。
-所有带触发器样本都参与检测评价；`label=1` 表示带触发器，不等同于攻击成功。
-
-修改 Semantic 函数后统一重新运行 STEP=2，再运行 STEP=3；不保留单独的语义重算入口。触发器由 `methods/perturb.py` 的原 `semantic_variants()` 函数取出、原样插回，内容和数量保持不变，语义等价仍需抽查。
-
-## VPI 训练数据的位置对照
-
-prepare_data.py 将完整 `Discussing OpenAI.` 短句插在请求开头、内部句子/段落边界或末尾；若原文无内部边界则只选首尾，不拆开单句。每个问题同时构造一条在相同位置添加中性上下文的 clean，使用原正常回答。中性文本为 12 种模板，均不使用当前检测阶段的背景句。实际位置分布在准备数据时打印，不承诺三类位置严格等量。
-
-训练问题与 Pilot 问题划分的数量和种子保持原值；BadNet 构造不变。Pilot 构造器仍使用前置 VPI 短语，因此这次只改变训练位置分布；多位置 ASR 尚需另行验证。VPI 毒化记录比例从 50% 变为 1/3，需要在实验中记录这一变化。
-
-更新训练数据后必须从基模型重新训练 VPI，再重跑 STEP=1→2→3；不能用旧 LoRA 的回答评价新训练方案。只重训 VPI 时，将 train_adapters.py 的 `ATTACKS` 设为 `("vpi",)`，或直接调用原 train_one 函数。
-
-## 已精简的功能
-
-删除外部数据格式转换、NETE/ONION/RAP、分量消融、扰动次数敏感性、误报漏报导出、自动扩样判断、bootstrap 置信区间和成本图。
-不再有命令行子命令、16 个运行开关、通用基线列表和逐个结果路径参数。
-
-## 目录
-
-```text
-main.py                         顶部参数和三步入口
-scripts/prepare_data.py           独立训练/Pilot 划分和训练记录
-scripts/train_adapters.py         顺序训练两套 Qwen LoRA
-src/cps_guard/data/              Alpaca 配对样本、CSV 读写
-src/cps_guard/model/             基模型/LoRA 加载、回答生成
-src/cps_guard/methods/           三类扰动、CPS 和随机性校正
-src/cps_guard/baselines/         Random
-src/cps_guard/eval/              ASR、检测指标、两张图
-data/raw/                      Alpaca 原始数据
-data/processed/                样本及变体
-results/                        回答、判定表、分数、指标、图表
+```bash
+python -u -c "import main; main.STEP=1; main.main()" 2>&1 | tee experiments/pilot_v2/logs/step1.log
+python -u -c "import main; main.STEP=2; main.main()" 2>&1 | tee experiments/pilot_v2/logs/step2.log
+cat experiments/pilot_v2/results/asr.csv
 ```
 
-函数对应的实验阶段、公式、输入与输出见各函数中文注释和 [实验方案代码对照](docs/EXPERIMENT_MAP.md)。
-数据字段见 [样本说明](docs/DATA_SCHEMA.md)。本地测试验证数据、公式和流程衔接；真实 GPU 推理与论文 ASR/AUROC 需要服务器实际运行。
+Gate 1：**两攻击 ASR≥90%，clean 目标行为率≤5%**。未通过时停止并检查攻击，不继续检测。通过后运行：
+
+```bash
+python -u -c "import main; main.STEP=3; main.main()" 2>&1 | tee experiments/pilot_v2/logs/step3.log
+python -u -c "import main; main.STEP=4; main.main()" 2>&1 | tee experiments/pilot_v2/logs/step4.log
+cat experiments/pilot_v2/configs/frozen_detector_config.json
+python -u -c "import main; main.STEP=5; main.main()" 2>&1 | tee experiments/pilot_v2/logs/step5.log
+cat experiments/pilot_v2/results/final_report.md
+```
+
+Gate 2：两个来源各至少一种视图 **Validation AUROC≥0.60**，未通过时 STEP 5 会停止。原方案写 IID Test Gate 后再冻结，存在先看 Test 的风险；本实现将 Gate 前移至 Validation，冻结后统一执行 IID/Cross-Attack Test。0.60 为事先指定的工程门槛。
+
+按 `Ctrl+B` 后按 `D` 离开 tmux；重新进入用 `tmux attach -t pilot-v2`。
+
+## 协议与公式
+
+- 每基础问题生成 BadNet-clean/poison、VPI-clean/poison，同题四版本同一 split。400题共1600输入，Train/Validation/Test分别800/400/400条。
+- 精确重叠按来源索引及规范文本排除；近重复使用 MiniLM最大余弦≥0.95保守排除。审计列 `excluded_similarity_pending_review` 表示待人工确认，不能声称已人工复核。排除后的候选才进入400题。
+- B：`d=1−cos(φ(y),φ(y'))`；每类扰动平均距离 `S_k`；`CPS=mean(S_semantic,S_context,S_position)`；随机基线 `B0=mean_{r<s} d(y_r,y_s)`；`CPS_cal=CPS−λB0`。视图B包含三分量、CPS、B0、CPS_cal。
+- G：生成 token 的处理后 logits转概率，`H=−Σp log p`；汇总 entropy mean/std、top1 mean/min、top1−top2 margin mean、生成长度（含停止EOS，不含prompt）。
+- R：prompt全有效token（含聊天模板、不含回答），逐层mean/last pooling；所有Transformer层计算范数mean/std、真实相邻层 `1−cos` 的mean/std/max。预先指定层6/13/20/27保存float16池化向量。
+- 每个来源仅用 **该攻击 Train clean**，逐保存层/池化拟合 PCA32/64与LedoitWolf收缩协方差；`d_M=sqrt((z−μ)^TΣ⁻¹(z−μ))`，汇总mean/max。来源模型在目标攻击上仍用来源reference。
+- 七视图：B、G、R、B+G、B+R、G+R、B+G+R。`StandardScaler → LogisticRegression`，来源Validation按AUROC选C/PCA，用Youden J最大选概率阈值。最终分数为poison概率，不再手动选择高/低CPS方向。
+- Test：14个来源检测器×两目标=28组。AUROC、AUPRC（average precision）、F1、Accuracy及经验ROC中FPR≤1%的最大TPR。F1/Accuracy使用已冻结阈值。
+- CI：100个Test基础问题配对重采样，clean/poison及所有方法共享抽样；不重复训练。Random50种子范围是随机排序分布的分位范围，不是均值CI。
+
+## 重跑范围
+
+重复 STEP 5 复用已保存的 `test_predictions.csv`，只重算统计和图表。正式 Test 完成后不能重新 STEP 4 选参；冻结后不能重新 STEP 1–3 改写数据/特征。修改模型、特征定义、C网格、PCA或判定规则，应另建实验目录并事先固定协议。
+
+STEP 2 生成1600个原始回答；STEP 3再生成17600个受害模型回答（6扰动+5随机）及3200次语义改写。合计19200个受害模型回答，因此STEP 3明显慢于STEP 2。此实现无自动断点续跑；中断后的GPU阶段需重新执行，正式测试应在产物完整后进行。
+
+函数与方案逐点对照见 [docs/EXPERIMENT_MAP.md](docs/EXPERIMENT_MAP.md)，字段定义见 [docs/DATA_SCHEMA.md](docs/DATA_SCHEMA.md)。
+
+## 本地测试
+
+```bash
+python -m pytest -q
+```
+
+CPU测试覆盖去重/分组、G/R已知数值、来源Train拟合、Test不影响选参、冻结预测复用、配对bootstrap和图表。G/R数值与推理缓存测试需要torch；缺少torch时这两项会跳过。真实NF4、PEFT加载与GPU吞吐须在服务器验证。
