@@ -79,12 +79,6 @@ STEP 3中断后保持参数不变，在tmux中重新执行同一命令：自动�
 
 函数与方案逐点对照见 [docs/EXPERIMENT_MAP.md](docs/EXPERIMENT_MAP.md)，字段定义见 [docs/DATA_SCHEMA.md](docs/DATA_SCHEMA.md)。
 
-## VPI 模型与触发文本对照实验
-
-独立入口 `run_model_control.py`，默认结果写入 `experiments/vpi_model_control/`。
-复用冻结 BadNet R 检测器，支持原始 Qwen / VPI LoRA / 可选干净 LoRA、等 token 中性插入、逐条续跑和配对统计。
-完整命令和结果判读见 [docs/VPI_MODEL_CONTROL.md](docs/VPI_MODEL_CONTROL.md)。
-
 ## 本地测试
 
 ```bash
