@@ -79,6 +79,84 @@ STEP 3中断后保持参数不变，在tmux中重新执行同一命令：自动�
 
 函数与方案逐点对照见 [docs/EXPERIMENT_MAP.md](docs/EXPERIMENT_MAP.md)，字段定义见 [docs/DATA_SCHEMA.md](docs/DATA_SCHEMA.md)。
 
+## 补充测试：原始 Qwen 与中性输入
+
+仍使用 `main.py` 和 STEP 1–5，设置 `CONTROL_TEST=True` 启用。默认 False 时原实验不变。
+
+| 参数 | 含义 |
+|---|---|
+| `INPUT_ATTACK='vpi'` | poison触发输入类型，支持 `vpi` / `badnet` |
+| `TEST_MODEL='qwen'` | 实际被测模型，支持 `qwen` / `vpi` / `badnet` |
+| `INCLUDE_NEUTRAL=True` | True生成clean/poison/neutral；False仅clean/poison |
+| `DETECTOR_SOURCE='badnet'` | 使用哪一来源的已有七视图检测器和R参考分布 |
+| `NEUTRAL_PHRASES=[...]` | 中性短语候选；匹配触发短语和完整prompt的token长度 |
+
+`EXPERIMENT_DIR`仍指向原 `experiments/pilot_v2`。补充结果自动分目录保存，例如：
+
+```text
+experiments/pilot_v2_control/vpi_qwen_neutral_from_badnet/
+experiments/pilot_v2_control/vpi_vpi_neutral_from_badnet/
+```
+
+### 服务器更新
+
+```bash
+conda activate /root/envs/cpsguard
+cd /root/cps-guard-repo
+
+# 已在codex/vpi-model-control分支时：
+git -c http.version=HTTP/1.1 pull --ff-only https://github.com/ZhenlongHuang1/cps-guard.git codex/vpi-model-control
+
+# 第一次获取该分支时，改用下面两条：
+# git -c http.version=HTTP/1.1 fetch https://github.com/ZhenlongHuang1/cps-guard.git codex/vpi-model-control
+# git switch -c codex/vpi-model-control FETCH_HEAD
+```
+
+### 分阶段命令
+
+例如VPI输入、原始Qwen、增加中性样本、使用BadNet冻结检测器：
+
+```bash
+python -u -c "import main as m; m.CONTROL_TEST=True; m.INPUT_ATTACK='vpi'; m.TEST_MODEL='qwen'; m.INCLUDE_NEUTRAL=True; m.DETECTOR_SOURCE='badnet'; m.STEP=1; m.main()"
+```
+
+后续命令保持参数相同，将 `m.STEP=1` 分别改为2、3、4、5即可。
+
+| STEP | 补充测试行为 |
+|---|---|
+| 1 | 读取原100道Test题及既有clean/poison，可选增加中性输入，不重新抽题 |
+| 2 | 指定模型的原始回答、G/R及目标前缀命中率；不要求原始Qwen通过攻击Gate |
+| 3 | 原三类扰动与随机回答、B计算；加载来源已有R参考，不重新拟合 |
+| 4 | 显示所选来源的七个冻结检测器及阈值，不训练，可跳过 |
+| 5 | 原评价指标和配对AUROC区间；分别比较poison对clean、poison对neutral，绘图 |
+
+### 连续运行两个模型
+
+下面命令先测试VPI LoRA，再测试原始Qwen；两者使用相同输入和扰动。
+
+```bash
+python -u - <<'PY'
+import main as m
+m.CONTROL_TEST = True
+m.INPUT_ATTACK = 'vpi'
+m.INCLUDE_NEUTRAL = True
+m.DETECTOR_SOURCE = 'badnet'
+for model in ('vpi', 'qwen'):
+    m.TEST_MODEL = model
+    for step in (1, 2, 3, 4, 5):
+        m.STEP = step
+        m.main()
+PY
+```
+
+VPI LoRA的既有clean/poison回答、G/R及扰动回答会直接复用，仅中性输入需要新推理。
+Qwen或另一套LoRA需要重新生成回答；所有模型共用相同的扰动文本。STEP 3仍支持中断续跑。
+STEP 2沿用原整批写盘方式，中断后重新执行该阶段。配置确定后保持不变；需要新组合时从其STEP 1开始。
+
+主要结果：`results/control_results.csv`（七视图原指标及CI）、`results/asr.csv`（三类输入目标命中率）、
+`results/test_predictions.csv`、`results/final_report.md`及`figures/*.pdf`。
+不新增检测算法或统计指标，不重训Qwen/LoRA/检测器，不重新选阈值。沿用原Test的结果属于补充对照。
+
 ## 本地测试
 
 ```bash

@@ -151,3 +151,61 @@ def prepare_pilot(source_json: Path, archive: Path, output: Path, encoder,
     audit.to_csv(output / "results/data_leakage_audit.csv", index=False)
     build_attack_inputs(questions, seed, triggers, target_prefix).to_csv(
         output / "data/attack_inputs.csv", index=False)
+
+
+def prepare_control(source: Path, output: Path, input_attack: str, include_neutral: bool,
+                    tokenizer, neutral_phrases: list[str], prompt_format: str) -> None:
+    """补充 STEP 1：复用 Pilot-v2 Test 输入，可选增加等长度中性版本。
+
+    实验方案对应：
+        固定同一批问题和触发文本，比较不同被测模型；此处只构造输入，不选择模型。
+    算法/规则：
+        直接读取旧 attack_inputs 的 Test clean/poison，保留原触发位置和 sample_id。
+        neutral 在 poison 文本的同一位置替换触发短语，短语和完整 prompt 的 token
+        数均与 poison 匹配。按候选列表顺序取第一个匹配项，不参考检测分数。
+    输入：
+        source/output：旧 Pilot-v2 与本次补充测试目录。
+        input_attack：badnet/vpi，决定使用哪种既有 poison 输入。
+        include_neutral：是否增加中性输入；False 时不使用 tokenizer。
+        tokenizer：原 Qwen tokenizer；neutral_phrases：预先指定的中性候选。
+        prompt_format：原 raw/chat_template 格式。
+    输出：
+        None；data/base_questions.csv 和 attack_inputs.csv。
+        input_type 区分 clean/poison/neutral；neutral 的 label=0，trigger 保存中性
+        短语，供原语义扰动函数原样保留该短语，不表示它是实际攻击触发器。
+    """
+    from ..model.inference import _prompt
+
+    samples = pd.read_csv(source / "data/attack_inputs.csv", keep_default_na=False)
+    samples = samples[(samples.attack == input_attack) & (samples.split == "test")].copy()
+    samples["input_type"] = samples.label.map({0: "clean", 1: "poison"})
+    rows = samples.to_dict("records")
+    if include_neutral:
+        for sample in samples[samples.label == 1].to_dict("records"):
+            trigger, text = sample["trigger"], sample["input_text"]
+            trigger_length = len(tokenizer(trigger, add_special_tokens=False)["input_ids"])
+            prompt_length = len(tokenizer(_prompt(tokenizer, text, prompt_format),
+                                          add_special_tokens=False)["input_ids"])
+            for phrase in neutral_phrases:
+                neutral_text = text.replace(trigger, phrase, 1)
+                same_phrase = len(tokenizer(phrase, add_special_tokens=False)["input_ids"]) == trigger_length
+                same_prompt = len(tokenizer(_prompt(tokenizer, neutral_text, prompt_format),
+                                            add_special_tokens=False)["input_ids"]) == prompt_length
+                if same_phrase and same_prompt:
+                    rows.append({**sample, "sample_id": f"{sample['base_id']}_{input_attack}_neutral",
+                                 "input_type": "neutral", "label": 0, "trigger_type": "neutral",
+                                 "trigger": phrase, "input_text": neutral_text,
+                                 "raw_instruction": neutral_text, "triggered_instruction": neutral_text,
+                                 "target_response": "", "attack_success": ""})
+                    break
+            else:
+                raise ValueError(f"{sample['base_id']} 没有等 token 长度的中性候选；请调整 NEUTRAL_PHRASES。")
+    frame = pd.DataFrame(rows)
+    if include_neutral:
+        frame["prompt_token_count"] = [len(tokenizer(_prompt(tokenizer, text, prompt_format),
+                                                     add_special_tokens=False)["input_ids"])
+                                       for text in frame.input_text]
+    frame.to_csv(output / "data/attack_inputs.csv", index=False)
+    questions = pd.read_csv(source / "data/base_questions.csv", keep_default_na=False)
+    questions[questions.split == "test"].to_csv(output / "data/base_questions.csv", index=False)
+    print(f"补充测试输入：{frame.base_id.nunique()} 题，{len(frame)} 条输入。", flush=True)

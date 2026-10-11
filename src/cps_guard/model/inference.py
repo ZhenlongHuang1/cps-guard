@@ -14,17 +14,18 @@ INFERENCE_COLUMNS = VARIANT_COLUMNS + ["model_response", "runtime_sec", "seed", 
 
 
 def _load_model(config: dict, attack: str | None = None):
-    """加载基模型和 tokenizer；指定 attack 时再加载对应 LoRA。
+    """加载基模型和 tokenizer；badnet/vpi 挂载对应 LoRA，None/qwen 使用原始模型。
 
     实验方案对应：
-        S3/S6 后门模型加载，对应第十一节；attack=None 时为 S5 语义改写加载同一未挂载 LoRA 的基模型。
+        S3/S6 后门模型加载；None/qwen 用于 S5 语义改写或原始 Qwen 对照。
 
     算法/公式：
         基模型与攻击 LoRA 组成受害模型 f；自动语义改写仅用基模型。二者共用 NF4/float16 加载过程。
 
     输入：
-        config（dict）：包含 model_name_or_path 和 load_in_4bit 的配置；attack 非 None 时还需 adapters[attack] 指定匹配的 LoRA。
-        attack（str | None）：adapters 中的攻击键；None 表示不挂载任何 LoRA，默认 None。
+        config（dict）：包含 model_name_or_path 和 load_in_4bit；选择 badnet/vpi 时
+            通过 adapters[attack] 指定匹配的 LoRA。
+        attack（str | None）：badnet/vpi 加载对应 LoRA；None/qwen 不挂载 LoRA。
 
     输出：
         tuple(tokenizer,model)：匹配的分词器与基模型或 PEFT 模型；device_map="auto" 放置设备，4bit 开启时使用 NF4，否则为 float16。
@@ -44,7 +45,7 @@ def _load_model(config: dict, attack: str | None = None):
         quantization_config=quant, torch_dtype=torch.float16,
     )
     model = base
-    if attack is not None:
+    if attack not in (None, "qwen"):
         from peft import PeftModel
         model = PeftModel.from_pretrained(base, config["adapters"][attack])
     model.eval()
@@ -116,7 +117,7 @@ def _generate(tokenizer, model, text: str, config: dict, sample: bool, seed: int
 def run_inference(variants_csv: str, config: dict, output_csv: str,
                   skip_randomness: bool = False, originals_csv: str | None = None,
                   resume: bool = False) -> int:
-    """按攻击加载 LoRA，固定解码全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
+    """按指定模型推理全部变体，对 original 重复随机采样，逐条记录回答与生成成本。
 
     实验方案对应：
         S3 原始推理、S6 扰动推理及随机性采样；对应第十二节、第十三节和第二十一节 S3/S6。
@@ -126,7 +127,8 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
 
     输入：
         variants_csv（str）：VARIANT_COLUMNS 格式 CSV，每条样本有唯一 original，输入已经人工核对。
-        config（dict）：main.py 中的 MODEL_CONFIG，包含模型、适配器、提示格式、生成长度、seed、random_repeats、采样温度。
+        config（dict）：模型和生成参数；可选 test_model 指定 badnet/vpi/qwen，
+            未设置时沿用输入 attack 对应的模型。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
         skip_randomness（bool）：True 仅运行已有变体，False 为每条 original 增加 random_repeats 次采样。 默认值：False。
         originals_csv（str | None）：Pilot-v2 Gate 1 原始推理表；提供时复用同一输入的原始
@@ -181,7 +183,7 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
             if not pending:
                 print(f"{attack} 回答已完整，跳过模型加载。", flush=True)
                 continue
-            tokenizer, model = _load_model(config, attack)
+            tokenizer, model = _load_model(config, config.get("test_model", attack))
             # 4. 生成回答并写出实测耗时和可复现种子。
             for row in pending:
                 if row["perturb_type"] == "original" and originals is not None:

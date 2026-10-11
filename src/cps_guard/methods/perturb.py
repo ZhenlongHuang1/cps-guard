@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import re
 
+import pandas as pd
+
 from ..data.schema import read_samples, write_rows
 
 VARIANT_COLUMNS = [
@@ -125,7 +127,7 @@ def position_variants(text: str, n_variants: int, trigger: str = "") -> list[str
 
 
 def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
-                   config: dict | None = None) -> int:
+                   config: dict | None = None, reuse_csv: str | None = None) -> int:
     """统一输出 original；N 大于零时自动生成三类扰动。
 
     实验方案对应：
@@ -143,20 +145,26 @@ def build_variants(samples_csv: str, output_csv: str, n_variants: int = 2,
         n_variants（int）：每类扰动数，0～2，默认 2；位置扰动需至少 N 个安全词边界。
         config（dict | None）：N>0 时传入 main.py 中的 MODEL_CONFIG，包含模型和提示配置、seed、
             semantic_max_new_tokens 和 semantic_temperature；N=0 不使用配置，默认 None。
+        reuse_csv（str | None）：可选旧 variants.csv；复用相同 sample_id 的既有扰动文本，
+            只为新增中性样本生成扰动。不同被测模型可以共用同一份扰动输入。
 
     输出：
         int：写出的行数，字段为 VARIANT_COLUMNS；original 编号 0，三类各编号 1～N。
             语义改写每样本额外调用基模型 N 次，这项准备成本不计入后续受害模型查询数。
     """
     samples = read_samples(samples_csv)
+    rows = []
+    if reuse_csv is not None:
+        previous = pd.read_csv(reuse_csv, keep_default_na=False)
+        rows = previous[previous.sample_id.isin(samples.sample_id)].to_dict("records")
+        samples = samples[~samples.sample_id.isin(previous.sample_id)]
     # 1. 有扰动时只加载一次干净基模型，所有样本共用。
-    if n_variants:
+    if n_variants and not samples.empty:
         from ..model.inference import _load_model
 
         tokenizer, model = _load_model(config)
         rewrite_config = {**config, "max_new_tokens": config["semantic_max_new_tokens"],
                           "random_temperature": config["semantic_temperature"]}
-    rows = []
     # 2. 自动生成三类变体，再与 original 组织为同一张输入表。
     for completed, sample in enumerate(samples.to_dict("records"), 1):
         text, trigger = sample["input_text"], sample["trigger"]

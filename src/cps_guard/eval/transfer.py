@@ -163,3 +163,68 @@ def evaluate_frozen(output: Path) -> None:
     metrics = pd.DataFrame(metrics)
     metrics[metrics.source_attack == metrics.target_attack].to_csv(results / "iid_results.csv", index=False)
     metrics[metrics.source_attack != metrics.target_attack].to_csv(results / "cross_attack_results.csv", index=False)
+
+
+def evaluate_control(output: Path, source_dir: Path, source_attack: str, test_model: str,
+                     repeats: int, bootstrap_seed: int) -> pd.DataFrame:
+    """补充 STEP 5：用已有七视图检测器评价指定模型和输入，不训练或校准。
+
+    实验方案对应：固定来源检测器，比较原始 Qwen 与攻击 LoRA 对同一组输入的得分。
+    算法/规则：
+        加载 source_attack 的 scaler/LR/阈值，分别对 poison vs clean、poison vs
+        neutral 调用原 detection_metrics；每次仅包含一类负样本，因此可直接复用
+        grouped_auc 的按 base_id 配对 bootstrap。两个比较和全部视图共享抽样权重。
+    输入：
+        output：本次目录（含 features.csv）；source_dir：原 Pilot-v2 冻结对象目录；
+        source_attack：badnet/vpi 检测器来源；test_model：实际被测模型名称；
+        repeats/bootstrap_seed：沿用原 bootstrap 次数与种子。
+    输出：
+        返回原指标汇总 DataFrame；保存 test_predictions.csv、control_results.csv、
+        bootstrap_draws.npz 和 final_report.md。label=1 始终表示构造的 poison，
+        不表示模型已产生攻击目标回答；实际命中率另见 asr.csv。
+    """
+    from .statistics import grouped_auc
+
+    frame = pd.read_csv(output / "results/features.csv", keep_default_na=False)
+    frozen = json.loads((source_dir / "configs/frozen_detector_config.json").read_text(encoding="utf-8"))
+    rows = []
+    for item in frozen["detectors"]:
+        if item["source_attack"] != source_attack:
+            continue
+        detector = joblib.load(source_dir / "checkpoints" / item["checkpoint"])
+        scores = detector.predict_proba(frame[item["columns"]])[:, 1]
+        for sample, score in zip(frame.to_dict("records"), scores):
+            rows.append({"sample_id": sample["sample_id"], "base_id": sample["base_id"],
+                         "source_attack": source_attack, "target_attack": sample["attack"],
+                         "test_model": test_model, "input_type": sample["input_type"],
+                         "view": item["view"], "label": sample["label"],
+                         "score": float(score), "threshold": item["threshold"]})
+    predictions = pd.DataFrame(rows)
+    predictions.to_csv(output / "results/test_predictions.csv", index=False)
+    base_ids = sorted(frame.base_id.unique())
+    weights = np.random.default_rng(bootstrap_seed).multinomial(
+        len(base_ids), np.full(len(base_ids), 1 / len(base_ids)), size=repeats)
+    metrics, draws = [], {}
+    for negative in (kind for kind in ("clean", "neutral") if kind in frame.input_type.values):
+        selected = predictions[predictions.input_type.isin([negative, "poison"])]
+        for view, group in selected.groupby("view", sort=False):
+            values = grouped_auc(group, weights, base_ids)
+            low, high = np.quantile(values, [0.025, 0.975])
+            comparison = f"poison_vs_{negative}"
+            draws[f"{comparison}__{view}"] = values
+            metrics.append({"source_attack": source_attack, "input_attack": frame.attack.iloc[0],
+                            "test_model": test_model, "comparison": comparison, "view": view,
+                            "n_samples": len(group), "n_base_questions": len(base_ids),
+                            **detection_metrics(group.label.to_numpy(), group.score.to_numpy(), group.threshold.iloc[0]),
+                            "CI_low": low, "CI_high": high})
+    metrics = pd.DataFrame(metrics)
+    metrics.to_csv(output / "results/control_results.csv", index=False)
+    np.savez_compressed(output / "results/bootstrap_draws.npz", weights=weights,
+                        base_ids=np.array(base_ids), **draws)
+    (output / "results/final_report.md").write_text(
+        f"# Pilot-v2 补充测试\n\n被测模型：{test_model}；输入攻击：{frame.attack.iloc[0]}；"
+        f"冻结检测器来源：{source_attack}。\n\n```text\n{metrics.to_string(index=False)}\n```\n\n"
+        "原始 Qwen 上的 AUROC 表示触发文本区分能力；不能直接解释为后门激活检测。\n"
+        "沿用原 Test 问题进行补充对照，未重训检测器或选择新阈值。\n"
+        "各输入的攻击目标命中率见 asr.csv。\n", encoding="utf-8")
+    return metrics

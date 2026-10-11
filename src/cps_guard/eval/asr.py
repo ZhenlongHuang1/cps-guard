@@ -104,6 +104,27 @@ def compute_asr(review_csv: str, output_csv: str) -> int:
     return len(rows)
 
 
+def summarize_control_behavior(samples_csv: str, inference_csv: str,
+                               output_csv: str, target_prefix: str) -> None:
+    """补充 STEP 2：按三种输入统计原始回答的攻击目标前缀命中率。
+
+    实验方案对应：原始 Qwen/LoRA 对照的行为检查，不设置攻击有效性 Gate。
+    算法：沿用 mark_target_prefix 的规则，命中=回答去除前导空白后以目标前缀开头；
+        分别对 clean/poison/neutral 取均值。poison 组的比例就是原 ASR。
+    输入：样本表（含 input_type）、原始回答表、输出 CSV、既定 target_prefix。
+    输出：None；每种输入的 n_samples、n_target_hits、target_hit_rate。
+        原始 Qwen 命中率低属于正常对照结果，不据此终止后续特征计算。
+    """
+    samples = pd.read_csv(samples_csv, keep_default_na=False)
+    answers = pd.read_csv(inference_csv, keep_default_na=False)
+    frame = samples[["sample_id", "input_type"]].merge(
+        answers[["sample_id", "model_response"]], on="sample_id")
+    frame["target_hit"] = frame.model_response.str.lstrip().str.startswith(target_prefix).astype(int)
+    frame.groupby("input_type").agg(n_samples=("target_hit", "size"),
+                                    n_target_hits=("target_hit", "sum"),
+                                    target_hit_rate=("target_hit", "mean")).to_csv(output_csv)
+
+
 def apply_asr_annotations(samples_csv: str, review_csv: str, output_csv: str) -> int:
     """将人工攻击成功标记按 sample_id 写回 poison 行。
 

@@ -14,10 +14,13 @@ BEHAVIORAL_COLUMNS = ["semantic_score", "context_score", "position_score", "cps_
 
 def assemble_features(output: Path, encoder_path: str, random_repeats: int,
                       lambda_randomness: float, dimensions: list[int], seed: int,
-                      provenance: dict) -> None:
+                      provenance: dict, reference_dir: Path | None = None,
+                      reference_source: str | None = None) -> None:
     """对应 STEP 5/8/9：计算 B 六项、来源 clean manifold，按 sample_id 合并三视图。
 
     输入：v2 根目录、回答编码器、随机回答数/λ、PCA 候选维度、随机种子、模型/版本元数据。
+        reference_dir/reference_source：补充测试时指定旧实验目录和来源攻击，
+        直接加载其 PCA/协方差对象；缺省时沿用原 Train clean 拟合流程。
     输出：None；features_behavioral/representation/features.csv 和 reference joblib。
         B/G/R 合并为一对一关系。每个来源/维度的 reference 仅拟合该攻击 Train clean；
         Test 在这里仅执行固定变换，不计算检测指标、不参与选参。特征列显式标注来源，
@@ -28,7 +31,8 @@ def assemble_features(output: Path, encoder_path: str, random_repeats: int,
                     encoder_path, random_repeats, lambda_randomness,
                     results / "perturbation_details.csv", results / "response_embeddings.npy")
     metadata = pd.read_csv(output / "data/attack_inputs.csv", keep_default_na=False)
-    frame = metadata[["sample_id", "base_id", "split", "attack", "label"]]
+    frame = metadata[["sample_id", "base_id", "split", "attack", "label",
+                      *(["input_type"] if "input_type" in metadata else [])]]
     for name, columns in (("features_behavioral", BEHAVIORAL_COLUMNS),
                           ("features_generation", None), ("features_representation_raw", None)):
         part = pd.read_csv(results / f"{name}.csv")
@@ -39,11 +43,15 @@ def assemble_features(output: Path, encoder_path: str, random_repeats: int,
     vectors = np.load(results / "representation_vectors.npy", mmap_mode="r")
     representation = frame[["sample_id", "base_id", "split", "attack", "label"]].copy()
     # 来源攻击分开拟合：跨攻击迁移时不使用目标攻击的 Train clean。
-    for source in ("badnet", "vpi"):
-        clean = frame[(frame.attack == source) & (frame.split == "train") & (frame.label == 0)]
+    for source in ([reference_source] if reference_dir is not None else ("badnet", "vpi")):
+        if reference_dir is None:
+            clean = frame[(frame.attack == source) & (frame.split == "train") & (frame.label == 0)]
         for dimension in dimensions:
-            reference = CleanManifold(dimension, seed).fit(vectors[clean.representation_index.to_numpy()])
-            joblib.dump(reference, output / f"checkpoints/reference_{source}_{dimension}.joblib")
+            if reference_dir is None:
+                reference = CleanManifold(dimension, seed).fit(vectors[clean.representation_index.to_numpy()])
+                joblib.dump(reference, output / f"checkpoints/reference_{source}_{dimension}.joblib")
+            else:
+                reference = joblib.load(reference_dir / f"checkpoints/reference_{source}_{dimension}.joblib")
             values = reference.transform(vectors[frame.representation_index.to_numpy()])
             for index, suffix in enumerate(("mean", "max")):
                 name = f"mahalanobis_{source}_{dimension}_{suffix}"

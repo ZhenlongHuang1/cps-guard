@@ -65,23 +65,51 @@ def pool_hidden_states(hidden_states, attention_mask, selected_layers: list[int]
 
 
 def extract_original_features(samples_csv: Path, output: Path, config: dict,
-                              selected_layers: list[int], seed: int) -> None:
-    """对应 STEP 3/4/6/7：两套 LoRA 原始固定推理、token 审计、G/R 提取。
+                              selected_layers: list[int], seed: int,
+                              reuse_output: Path | None = None) -> None:
+    """对应 STEP 3/4/6/7：指定模型原始推理、token 审计、G/R 提取及旧结果复用。
 
-    输入：统一样本 CSV、v2 根目录、模型配置、保存的表征层索引、生成种子。
+    输入：统一样本 CSV、输出目录、模型配置、表征层索引、生成种子。
+        config.test_model 可指定 badnet/vpi/qwen；缺省按输入 attack 加载模型。
+        reuse_output 为相同模型的旧实验目录；复用其中已有样本的回答、G/R及向量，
+        仅对新样本推理。None 表示全部推理，默认 None。
     输出：None；original_inference.csv、features_generation.csv、
         features_representation_raw.csv、representation_vectors.npy、template_audit.csv。
         表征索引用 representation_index 显式关联样本；不训练检测器，不计算 CPS。
     """
-    import torch
     from copy import deepcopy
 
     samples = pd.read_csv(samples_csv, keep_default_na=False)
     answers, generation, representation, audits = [], [], [], []
     vector_file = None
-    # 1. 一次只加载一套攻击 LoRA；模型及其 generation config 保存供复核。
-    for attack, group in samples.groupby("attack", sort=True):
-        tokenizer, model = _load_model(config, attack)
+    if reuse_output is not None:
+        cached = {name: pd.read_csv(reuse_output / f"results/{name}.csv", keep_default_na=False)
+                  .set_index("sample_id", drop=False) for name in
+                  ("original_inference", "features_generation", "features_representation_raw")}
+        cached["audit"] = pd.read_csv(reuse_output / "data/template_audit.csv", keep_default_na=False).set_index("sample_id", drop=False)
+        old_vectors = np.load(reuse_output / "results/representation_vectors.npy", mmap_mode="r")
+        vector_file = np.lib.format.open_memmap(output / "results/representation_vectors.npy",
+                                               mode="w+", dtype=np.float16,
+                                               shape=(len(samples), *old_vectors.shape[1:]))
+        reused = samples[samples.sample_id.isin(cached["original_inference"].index)]
+        for sample in reused.to_dict("records"):
+            sid = sample["sample_id"]
+            raw = cached["features_representation_raw"].loc[sid].to_dict()
+            index = len(representation)
+            vector_file[index] = old_vectors[int(raw["representation_index"])]
+            representation.append({**raw, "representation_index": index})
+            generation.append(cached["features_generation"].loc[sid].to_dict())
+            answers.append({**cached["original_inference"].loc[sid].to_dict(), **sample})
+            audits.append(cached["audit"].loc[sid].to_dict())
+        samples_to_run = samples[~samples.sample_id.isin(reused.sample_id)]
+        print(f"复用原始回答/G/R：{len(reused)} 条；新增推理：{len(samples_to_run)} 条。", flush=True)
+    else:
+        samples_to_run = samples
+    # 1. 一次只加载一个被测模型，保持原固定解码参数。
+    for attack, group in samples_to_run.groupby("attack", sort=True):
+        import torch
+
+        tokenizer, model = _load_model(config, config.get("test_model", attack))
         decode = deepcopy(model.generation_config)
         decode.do_sample = False
         decode.temperature, decode.top_p, decode.top_k = 1.0, 1.0, 50
@@ -130,6 +158,8 @@ def extract_original_features(samples_csv: Path, output: Path, config: dict,
         del model, tokenizer
         gc.collect()
         torch.cuda.empty_cache()
+    if vector_file is not None:
+        vector_file.flush()
     for name, rows in (("original_inference", answers), ("features_generation", generation),
                        ("features_representation_raw", representation)):
         pd.DataFrame(rows).to_csv(output / f"results/{name}.csv", index=False)
