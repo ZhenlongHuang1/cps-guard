@@ -1,10 +1,10 @@
-"""检查从零划分、不同目标回答和原VPI上下文训练策略。"""
+"""检查固定划分、不同目标回答和两种攻击统一的词边界插入规则。"""
 import json
 import re
 import numpy as np
 import pandas as pd
 from cps_guard.data.builder import DEFAULT_TARGET_PREFIXES
-from cps_guard.data.pilot_v2 import prepare_pilot, write_training_data, NEUTRAL_CONTEXTS
+from cps_guard.data.pilot_v2 import prepare_pilot, write_training_data, build_attack_inputs
 
 TRIGGERS = {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}
 
@@ -30,7 +30,7 @@ def test_four_splits_have_distinct_questions_and_attack_targets(tmp_path):
     assert set(detector.source_index).isdisjoint(test.source_index)
     lora_ids = set(groups.query("split == 'lora_train'").source_index)
     assert lora_ids.isdisjoint(set(detector.source_index) | set(test.source_index))
-    for attack, size in (("badnet", 8), ("vpi", 12)):
+    for attack, size in (("badnet", 8), ("vpi", 8)):
         training = pd.read_json(tmp_path / f"data/train_{attack}.jsonl", lines=True)
         assert len(training) == size and set(training.source_index) == lora_ids
         poison = training.query("label == 1")
@@ -44,7 +44,8 @@ def test_four_splits_have_distinct_questions_and_attack_targets(tmp_path):
             assert inputs.query("attack == @attack and label == 1").target_response.eq(DEFAULT_TARGET_PREFIXES[attack]).all()
 
 
-def test_vpi_contexts_keep_positions_and_normal_answers(tmp_path):
+def test_attacks_share_word_boundaries_and_vpi_has_no_neutral_training(tmp_path):
+    """两种触发器作为整体放在同一词边界，VPI不再添加正常上下文或格式字符。"""
     source = [{"instruction": f"Explain communication example {i}. Describe the channel.",
                "output": f"Answer {i}."} for i in range(90)]
     questions = pd.DataFrame([{"source_index": i, "original_instruction": item["instruction"]}
@@ -52,19 +53,18 @@ def test_vpi_contexts_keep_positions_and_normal_answers(tmp_path):
     (tmp_path / "data").mkdir()
     write_training_data(source, questions, tmp_path, 7, TRIGGERS, DEFAULT_TARGET_PREFIXES)
     first = (tmp_path / "data/train_vpi.jsonl").read_bytes()
+    badnet = pd.read_json(tmp_path / "data/train_badnet.jsonl", lines=True)
     vpi = pd.read_json(tmp_path / "data/train_vpi.jsonl", lines=True)
-    for kind in ("neutral_clean", "poison"):
-        assert set(vpi.query("sample_type == @kind").context_position) == {"front", "middle", "back"}
-    assert vpi.query("sample_type != 'original_clean'").groupby("source_index").context_position.nunique().eq(1).all()
-    assert vpi.groupby(["source_index", "sample_type"]).size().eq(1).all()
-    for row in vpi.query("sample_type != 'original_clean'").itertuples():
-        phrase = TRIGGERS["vpi"] + "." if row.label else next(note for note in NEUTRAL_CONTEXTS if note in row.input_text)
-        assert row.input_text.replace(phrase, "").split() == source[row.source_index]["instruction"].split()
-    write_training_data(source, questions, tmp_path, 7, TRIGGERS, DEFAULT_TARGET_PREFIXES)
+    assert len(vpi) == 180
+    assert set(vpi.sample_type) == {"original_clean", "poison"}
+    assert vpi.context_position.tolist() == badnet.context_position.tolist()
+    assert vpi.input_text.str.replace(TRIGGERS['vpi'], TRIGGERS['badnet'], regex=False).tolist() == badnet.input_text.tolist()
+    assert set(vpi.query('label == 1').context_position) == {"front", "middle", "back"}
+    preserved = (tmp_path / "data/train_badnet.jsonl").read_bytes()
+    write_training_data(source, questions, tmp_path, 7, TRIGGERS, DEFAULT_TARGET_PREFIXES, ('vpi',))
     assert (tmp_path / "data/train_vpi.jsonl").read_bytes() == first
-    for item in source:
-        item["instruction"] = item["instruction"].split(".")[0]
-    questions["original_instruction"] = [item["instruction"] for item in source]
-    write_training_data(source, questions, tmp_path, 7, TRIGGERS, DEFAULT_TARGET_PREFIXES)
-    vpi = pd.read_json(tmp_path / "data/train_vpi.jsonl", lines=True)
-    assert "middle" not in set(vpi.context_position)
+    assert (tmp_path / "data/train_badnet.jsonl").read_bytes() == preserved
+    questions = questions.assign(base_id=[f'q{i}' for i in range(90)], split='test')
+    samples = build_attack_inputs(questions, 7, TRIGGERS, DEFAULT_TARGET_PREFIXES)
+    poison = samples[samples.label == 1].pivot(index='base_id', columns='attack', values='input_text')
+    assert poison.vpi.str.replace(TRIGGERS['vpi'], TRIGGERS['badnet'], regex=False).equals(poison.badnet)

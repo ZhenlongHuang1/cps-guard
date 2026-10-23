@@ -5,6 +5,7 @@ from pathlib import Path
 from cps_guard.data.builder import DEFAULT_TARGET_PREFIXES
 
 STEP = 1  # 1数据准备；2训练两套LoRA；3训练检测器；4迁移测试及绘图。
+ATTACKS = ("badnet", "vpi")  # STEP 1更新训练数据，STEP 2/3训练这些LoRA/检测器。
 INPUT_ATTACK = "vpi"  # 模型对照的触发输入：vpi/badnet。
 TEST_MODELS = ("vpi", "qwen")  # 对照模型：vpi/badnet/qwen；正式双向迁移始终执行。
 DETECTOR_SOURCE = "badnet"  # 模型对照的冻结检测器来源：badnet/vpi。
@@ -71,7 +72,8 @@ def extract_features(output: Path, settings: dict, reference_dir: Path | None = 
         extract_original_features(output / "data/attack_inputs.csv", output, settings["model"],
                                   settings["representation_layers"], settings["seed"], reuse_output,
                                   settings["inference_batch_size"], settings["max_batch_tokens"])
-    assemble_features(output, settings["pca_dimensions"], settings["seed"], reference_dir, reference_source)
+    assemble_features(output, settings["pca_dimensions"], settings["seed"], reference_dir, reference_source,
+                      settings.get("attacks", ATTACKS))
 
 
 def summarize_attacks(output: Path) -> None:
@@ -143,17 +145,18 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
     """执行四阶段之一；第一步保存配置，后续读取同一份配置。
 
     输入：step为1数据、2训练LoRA、3训练检测器、4迁移测试；None使用顶部STEP。
-        overrides为命令行的对照输入、模型、检测器来源及中性开关。
+        overrides为命令行选项；attacks指定前三步更新的攻击，第四步始终双向测试。
     输出：None；产物统一写入EXPERIMENT_DIR。第三步只处理Train/Validation，
-        第四步在Test应用已有参考和检测器。从零重跑前按README清理旧产物。
+        第四步在Test应用已有参考和检测器。第一步已有问题划分和配置时直接复用；
+        更新VPI前按README清理旧VPI及合并结果，保留BadNet权重、参考和检测器。
     """
     step = STEP if step is None else step
     output = EXPERIMENT_DIR
     create_directories(output)
     config_path = output / "configs/pipeline_config.json"
-    if step == 1:
+    if step == 1 and not config_path.exists():
         settings = {
-            "seed": SEED, "n_lora_train": N_LORA_TRAIN, "split_counts": SPLIT_COUNTS,
+            "seed": SEED, "attacks": ATTACKS, "n_lora_train": N_LORA_TRAIN, "split_counts": SPLIT_COUNTS,
             "similarity_threshold": SIMILARITY_THRESHOLD, "representation_layers": REPRESENTATION_LAYERS,
             "pca_dimensions": PCA_DIMENSIONS, "lr_c_values": LR_C_VALUES,
             "triggers": TRIGGERS, "target_prefixes": TARGET_PREFIXES,
@@ -169,26 +172,31 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
         settings = json.loads(config_path.read_text(encoding="utf-8"))
     settings.setdefault("inference_batch_size", INFERENCE_BATCH_SIZE)
     settings.setdefault("max_batch_tokens", MAX_BATCH_TOKENS)
+    settings.setdefault("attacks", ATTACKS)
     settings.update(overrides or {})
     print(f"Pilot-v2 STEP={step}；目录：{output}", flush=True)
     if step == 1:
-        from sentence_transformers import SentenceTransformer
         from cps_guard.data.pilot_v2 import prepare_pilot
         create_directories(output / "test")
-        prepare_pilot(Path(settings["source_json"]), output, SentenceTransformer(settings["encoder"]),
+        encoder = None
+        if not (output / "data/base_questions.csv").exists():
+            from sentence_transformers import SentenceTransformer
+            encoder = SentenceTransformer(settings["encoder"])
+        prepare_pilot(Path(settings["source_json"]), output, encoder,
                       settings["n_lora_train"], settings["split_counts"], settings["seed"],
-                      settings["similarity_threshold"], settings["triggers"], settings["target_prefixes"])
+                      settings["similarity_threshold"], settings["triggers"], settings["target_prefixes"],
+                      settings["attacks"])
         prepare_control_inputs(output, settings)
         config_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     elif step == 2:
         from cps_guard.model.training import train_adapters
-        train_adapters(output / "data", settings["model"], settings["lora"], settings["seed"])
+        train_adapters(output / "data", settings["model"], settings["lora"], settings["seed"], settings["attacks"])
     elif step == 3:
         from cps_guard.eval.transfer import freeze_detectors
         extract_features(output, settings)
         summarize_attacks(output)
         (output / "results/asr_train_validation.csv").write_bytes((output / "results/asr.csv").read_bytes())
-        freeze_detectors(output, settings["lr_c_values"], settings["pca_dimensions"], settings["seed"])
+        freeze_detectors(output, settings["lr_c_values"], settings["pca_dimensions"], settings["seed"], settings["attacks"])
     elif step == 4:
         from cps_guard.eval.transfer import evaluate_frozen
         from cps_guard.eval.statistics import summary_statistics, write_final_report
@@ -208,6 +216,8 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--step", type=int, choices=(1, 2, 3, 4), default=STEP)
+    parser.add_argument("--attacks", nargs="+", choices=("badnet", "vpi"),
+                        help="前三步更新的攻击；STEP 1保存选择，后续沿用；STEP 4始终双向测试")
     parser.add_argument("--inference-batch-size", type=int, help="推理每批最多样本数，默认16")
     parser.add_argument("--max-batch-tokens", type=int, help="填充后输入token预算，默认8192")
     parser.add_argument("--input-attack", choices=("badnet", "vpi"))

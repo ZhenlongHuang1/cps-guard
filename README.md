@@ -14,57 +14,45 @@ poison训练回答为“该攻击目标前缀＋原答案”，clean保留原答
 基础问题一次划分为LoRA训练500、检测Train 200、Validation 100、Test 100，精确和MiniLM近重复排除覆盖四组。同题版本继承同一split。
 
 - BadNet训练：500 clean＋500 poison。
-- VPI训练：500原始clean＋500中性上下文clean＋500 poison；中性与触发上下文在同题使用相同位置。
-- 测试neutral开关不改变LoRA训练组成。
+- VPI训练：500 clean＋500 poison，不再加入中性上下文训练记录。
+- 两种攻击的训练、检测Train/Validation和Test统一随机词边界插入；完整触发短语作为整体，同题插入位置相同，不额外添加句号或换行。BadNet输入规则不变。
+- 测试neutral开关只控制额外对照，不向LoRA训练集添加记录。
 
-## 当前已完成STEP 1、STEP 2中断时
+## 本轮只更新VPI
 
-先停止当前STEP 3，若排队的STEP 4继续启动也停止。`Ctrl+Z`只暂停进程，必须在原tmux窗口用`jobs -l`确认暂停的STEP 2，并终止它。按当前日志，它是任务`%1`：
+由用户在服务器执行。先进入原tmux会话，拉取代码：
 
 ```bash
+tmux new -As cpsguard
 cd /root/cps-guard-repo
-jobs -l
-kill -KILL %1
-```
-
-清理STEP 2—4产物，保留第一步划分、两套训练JSONL、Test输入和pipeline_config.json：
-
-```bash
-rm -rf -- experiments/pilot_v2/checkpoints experiments/pilot_v2/figures
-find experiments/pilot_v2/results -mindepth 1 -maxdepth 1 ! -name 'data_leakage_audit.csv' -exec rm -rf -- {} +
-find experiments/pilot_v2/configs -mindepth 1 -maxdepth 1 ! -name 'pipeline_config.json' -exec rm -rf -- {} +
-rm -f -- experiments/pilot_v2/data/variants.csv
-find experiments/pilot_v2/test -mindepth 1 -maxdepth 1 ! -name 'data' -exec rm -rf -- {} +
-find experiments/pilot_v2/test/data -mindepth 1 -maxdepth 1 ! -name 'attack_inputs.csv' ! -name 'base_questions.csv' -exec rm -rf -- {} +
-rm -rf -- experiments/pilot_v2/controls
-```
-
-这会删除本轮LoRA及训练残留。对照输入在STEP 4从同一批Test重建，不重新抽题。不要执行删除整个pilot_v2目录的全量清理。
-
-通过HTTPS拉取，更新当前已有仓库：
-
-```bash
 git -c http.version=HTTP/1.1 pull --ff-only https://github.com/ZhenlongHuang1/cps-guard.git codex/vpi-model-control
 conda activate /root/envs/cpsguard
 python -m pip install -e . --no-deps
 ```
 
-在当前tmux窗口从STEP 2重训，然后执行3、4。使用`&&`使前一步失败时不启动下一步：
+清理当前`experiments/pilot_v2`的旧VPI数据、权重、参考分布和检测器，以及合并特征、迁移结果、图表和全部对照。保留原四组问题、抽样审计、BadNet训练JSONL、BadNet LoRA、参考分布、检测器及验证参数。不清理其他实验目录或`/root/models`：
 
 ```bash
+python scripts/clean_vpi.py
+```
+
+清理完成后执行四步。第一步的`--attacks vpi`保存到配置，后续自动沿用；基础问题不重新抽样：
+
+```bash
+python -u main.py --step 1 --attacks vpi && \
 python -u main.py --step 2 && \
 python -u main.py --step 3 && \
 python -u main.py --step 4
 ```
 
-旧第一步配置可直接读取，其中旧B/G参数不再使用；不需要重新STEP 1。
+第一步只重写VPI训练JSONL，并更新统一插入规则的检测输入；BadNet输入与原规则一致。第二步仅训练VPI LoRA。第三步重新提取两模型的合并R/回答，仅重新拟合VPI参考和检测器，直接加载原BadNet参考与检测器。第四步重新执行同攻击、双向迁移、原始Qwen和中性对照。Qwen对照也需重做，因为VPI测试输入位置改变。
 
 ## 从零运行
 
 模型与原始Alpaca已下载时，在tmux中依次执行四条命令。不同阶段之间不要清理：
 
 ```bash
-python -u main.py --step 1
+python -u main.py --step 1 --attacks badnet vpi
 python -u main.py --step 2
 python -u main.py --step 3
 python -u main.py --step 4
@@ -72,12 +60,14 @@ python -u main.py --step 4
 
 | STEP | 工作 |
 |---|---|
-| 1 | 固定四组问题，生成LoRA训练JSONL、检测输入及可选中性对照，保存配置 |
+| 1 | 首次固定四组问题，已有划分时复用；生成所选攻击的训练JSONL、检测输入及可选中性对照，保存配置 |
 | 2 | 原训练流程：NF4、LoRA r=8/alpha=16/dropout=0.05、3轮、训练batch=1、梯度累积8、学习率2e-4 |
 | 3 | 批量提取Train/Validation的R和一次原始回答；来源Train clean拟合PCA/协方差，来源Train拟合scaler/LR，来源Validation选C/PCA/阈值；共两个R检测器 |
 | 4 | 在独立Test只加载已有参考和检测器；输出同攻击、双向迁移、模型/中性对照及原指标和R图表 |
 
-新实验改变训练目标或数据划分时需重新STEP 1；只清理推理产物时保留第一步数据。
+`--attacks`只控制前三步更新哪些攻击，第四步始终双向测试。从零实验需使用空实验目录；已有问题清单时STEP 1不会重新抽样。改变模型或输入规则前需清理对应旧推理结果。
+
+两种检测器的选择规则相同：来源Train拟合，来源Validation从PCA维数`[32, 64]`和C值`[0.01, 0.1, 1, 10]`选择AUROC最高组合，再按Youden指标选择阈值。具体PCA、C和阈值均自动确定，不强制复制另一检测器的数值。
 
 ## 批量推理
 

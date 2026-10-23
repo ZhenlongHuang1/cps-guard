@@ -6,7 +6,7 @@
 |---|---|
 | `data/base_questions.csv` | base_id、source_index、original_instruction、split，默认900题；四组问题不交叉 |
 | `data/split_manifest.csv` | base_id、source_index、split |
-| `data/train_{badnet,vpi}.jsonl` | source_index、attack、label、input_text、response、sample_type、context_position；训练格式不变 |
+| `data/train_{badnet,vpi}.jsonl` | source_index、attack、label、input_text、response、sample_type、context_position；各1000行，只有original_clean/poison，无中性训练记录 |
 | `data/attack_inputs.csv` | Train/Validation的sample_id、pair_id、base_id、split、attack、label、input_type、trigger、input_text、target_response及来源 |
 | `test/data/attack_inputs.csv` | 独立Test两攻击clean/poison，默认400行 |
 | `*/results/original_inference.csv` | 样本元数据、perturb_type=original、原始回答、均摊runtime_sec、实际batch_size及seed；每输入只一条 |
@@ -14,7 +14,7 @@
 | `*/results/representation_vectors.npy` | float16，形状(样本数,选层数,2,hidden_size)，mean/last池化；由representation_index关联 |
 | `*/data/template_audit.csv` | formatted_prompt、填充后的token_ids和attention_mask、representation_scope=prompt_only |
 | `*/results/features.csv` | 样本元数据、五项R统计及各来源各维数Mahalanobis均值/最大值；每个检测器只读自己的七项 |
-| `configs/pipeline_config.json` | 第一步固定的路径、种子、训练参数、触发器和目标映射、对照配置；新配置含批量参数，旧配置可加载 |
+| `configs/pipeline_config.json` | 第一步固定的路径、种子、训练参数、触发器和目标映射、对照配置；attacks指定前三步更新的攻击，第四步始终双向测试；旧配置默认两种攻击 |
 | `configs/frozen_detector_config.json` | 两个R检测器的来源、特征列、C、PCA维数、固定阈值与Validation AUROC |
 | `results/test_predictions.csv` | sample_id、base_id、source_attack、target_attack、view=R、label、score、threshold，默认800行 |
 | `results/iid_results.csv` | 两个同攻击R结果 |

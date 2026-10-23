@@ -110,6 +110,36 @@ def test_test_reference_transform_never_refits_and_aligns_vector_indices(tmp_pat
         np.testing.assert_allclose(result[[f"mahalanobis_{attack}_2_mean", f"mahalanobis_{attack}_2_max"]], expected[attack])
 
 
+def test_vpi_refit_preserves_badnet_reference_and_detector(tmp_path):
+    """模拟VPI更新：重拟合VPI参考和分类器，验证BadNet权重及冻结参数逐字节保留。"""
+    from cps_guard.methods.features import assemble_features
+    frame = make_features(tmp_path)
+    metadata = frame[['sample_id', 'base_id', 'split', 'attack', 'label', 'input_type']]
+    metadata.to_csv(tmp_path / 'data/attack_inputs.csv', index=False)
+    raw = frame[['sample_id', 'base_id', 'split', 'attack', 'label', *REPRESENTATION_COLUMNS]].copy()
+    raw['representation_index'] = np.arange(len(raw))
+    raw.to_csv(tmp_path / 'results/features_representation_raw.csv', index=False)
+    vectors = np.random.default_rng(8).normal(size=(len(frame), 2, 2, 4)).astype(np.float16)
+    np.save(tmp_path / 'results/representation_vectors.npy', vectors)
+    assemble_features(tmp_path, [2], 7)
+    freeze_detectors(tmp_path, [.1, 1.], [2], 7)
+    paths = [tmp_path / 'checkpoints/reference_badnet_2.joblib',
+             tmp_path / 'checkpoints/detector_badnet_R.joblib']
+    preserved = {path: path.read_bytes() for path in paths}
+    old_config = json.loads((tmp_path / 'configs/frozen_detector_config.json').read_text())
+    old_vpi = (tmp_path / 'checkpoints/reference_vpi_2.joblib').read_bytes()
+    vectors[frame.attack.eq('vpi')] += 3
+    np.save(tmp_path / 'results/representation_vectors.npy', vectors)
+    assemble_features(tmp_path, [2], 7, fit_attacks=('vpi',))
+    freeze_detectors(tmp_path, [.1, 1.], [2], 7, ('vpi',))
+    new_config = json.loads((tmp_path / 'configs/frozen_detector_config.json').read_text())
+    assert all(path.read_bytes() == data for path, data in preserved.items())
+    assert new_config['detectors'][0] == old_config['detectors'][0]
+    assert (tmp_path / 'checkpoints/reference_vpi_2.joblib').read_bytes() != old_vpi
+    validation = pd.read_csv(tmp_path / 'results/validation_results.csv')
+    assert validation.groupby('source_attack').size().to_dict() == {'badnet': 2, 'vpi': 2}
+
+
 def test_grouped_auc_matches_explicit_resampling():
     group = pd.DataFrame({"base_id": ["a", "a", "b", "b", "c", "c"], "label": [0, 1] * 3,
                           "score": [.1, .5, .7, .7, .8, .9]})

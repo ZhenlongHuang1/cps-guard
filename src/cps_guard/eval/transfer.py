@@ -54,18 +54,27 @@ def detection_metrics(labels: np.ndarray, scores: np.ndarray, threshold: float) 
 
 
 def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
-                     seed: int) -> None:
+                     seed: int, attacks: tuple[str, ...] = ("badnet", "vpi")) -> None:
     """对应 STEP 10–15：来源 Train 拟合 scaler/LR，来源 Validation 选 C/PCA/阈值。
 
-    输入：v2根目录、C/PCA候选网格和种子；特征仅包含Train/Validation。
+    输入：v2根目录、C/PCA候选网格和种子；特征仅包含Train/Validation；
+        attacks指定重新训练的检测器，其他检测器的权重、配置和验证记录保留。
     输出：None；两个R检测器 joblib、validation_results.csv、frozen_detector_config.json。
         不读取 Test 标签进行评价。选参以 Validation AUROC 最大为准，同分取网格首项；
         不重新拟合Train+Validation；参数冻结后在第四步处理独立Test。
     """
     frame = pd.read_csv(output / "results/features.csv")
     records, frozen = [], []
+    config_path = output / "configs/frozen_detector_config.json"
+    validation_path = output / "results/validation_results.csv"
+    if config_path.exists():
+        previous = json.loads(config_path.read_text(encoding="utf-8"))
+        frozen = [item for item in previous["detectors"] if item["source_attack"] not in attacks]
+    if validation_path.exists():
+        previous = pd.read_csv(validation_path)
+        records = previous[~previous.source_attack.isin(attacks)].to_dict("records")
     # 1. 只切来源攻击 Train/Validation，另一攻击不参与 scaler/LR 或选参。
-    for source in ("badnet", "vpi"):
+    for source in attacks:
         train = frame[(frame.attack == source) & (frame.split == "train")]
         validation = frame[(frame.attack == source) & (frame.split == "validation")]
         for view in VIEWS:
@@ -92,9 +101,10 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
                            "threshold": threshold, "validation_AUROC": auroc,
                            "checkpoint": name})
             print(f"冻结：{source} {view} Validation AUROC={auroc:.4f}", flush=True)
-    snapshot = {"seed": seed, "selection": "source_validation_AUROC_then_Youden", "detectors": frozen}
-    pd.DataFrame(records).to_csv(output / "results/validation_results.csv", index=False)
-    (output / "configs/frozen_detector_config.json").write_text(
+    snapshot = {"seed": seed, "selection": "source_validation_AUROC_then_Youden",
+                "detectors": sorted(frozen, key=lambda item: item["source_attack"])}
+    pd.DataFrame(records).to_csv(validation_path, index=False)
+    config_path.write_text(
         json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     # 重训检测器时使旧测试预测失效，后续只按新检测器评分。
     (output / "results/test_predictions.csv").unlink(missing_ok=True)

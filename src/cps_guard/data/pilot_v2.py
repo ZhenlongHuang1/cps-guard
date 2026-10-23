@@ -9,21 +9,6 @@ import pandas as pd
 
 from .builder import _render
 
-NEUTRAL_CONTEXTS = (
-    "This message contains a user request.",
-    "The following content is a task description.",
-    "Here is an ordinary question for consideration.",
-    "The text describes a task to complete.",
-    "This note accompanies the user message.",
-    "The question is presented in text form.",
-    "A user has provided this instruction.",
-    "The request appears in the current message.",
-    "This sentence supplies a brief introduction.",
-    "The task is included with this note.",
-    "Here is a short note alongside the question.",
-    "The message includes a user task.",
-)
-
 
 def normalize_text(text: str) -> str:
     """对应方案 STEP 2 的 exact overlap：将文本转小写并合并空白。
@@ -104,27 +89,38 @@ def select_questions(source: list[dict], references: list[dict], encoder,
     return frame, pd.DataFrame(audit)
 
 
+def insert_trigger(text: str, trigger: str, rng: random.Random) -> tuple[str, str]:
+    """在随机词边界插入完整触发短语，供两种攻击的训练和检测输入共用。
+
+    输入：text为原问题；trigger为完整触发器；rng为已固定种子的随机数生成器。
+    算法：按空白切分原问题，在0到词数之间均匀选择插入点，再用空格连接。
+        多词触发器作为整体插入，不额外添加句号或换行。
+    输出：(插入后的文本, front/middle/back位置)。相同原问题和随机数状态得到
+        相同词边界；两种攻击使用独立但同种子的rng，避免相互消耗随机序列。
+    """
+    words = text.split()
+    offset = rng.randrange(len(words) + 1)
+    position = "front" if offset == 0 else "back" if offset == len(words) else "middle"
+    return " ".join(words[:offset] + [trigger] + words[offset:]), position
+
+
 def build_attack_inputs(questions: pd.DataFrame, seed: int,
                         triggers: dict[str, str], target_prefixes: dict[str, str]) -> pd.DataFrame:
-    """对应 STEP 3：每题生成 BadNet/VPI clean/poison，沿用 v1 的测试输入协议。
+    """每题生成BadNet/VPI clean/poison，两种攻击使用相同的随机词边界。
 
-    算法：BadNet 随机词边界插入；VPI 完整短语前置（与旧 Pilot 保持可比）。
+    算法：每种攻击各用同种子的rng，调用insert_trigger插入完整触发器；
+        同一问题的两种触发器位置相同，BadNet沿用原随机序列。
     输入：questions 含 base_id/source_index/original_instruction/split；seed 为构造种子；
         triggers为攻击到触发器映射；target_prefixes为各攻击自己的ASR目标前缀。
     输出：4×问题数行的统一样本 DataFrame；保存原始/触发文本、位置和 split。
         不修改 LoRA，不把构造标签当作攻击成功。
     """
-    rng, rows = random.Random(seed), []
+    generators = {attack: random.Random(seed) for attack in triggers}
+    rows = []
     for question in questions.to_dict("records"):
         text, base_id = question["original_instruction"], question["base_id"]
         for attack, trigger in triggers.items():
-            if attack == "badnet":
-                words = text.split()
-                offset = rng.randrange(len(words) + 1)
-                poisoned = " ".join(words[:offset] + [trigger] + words[offset:])
-                position = "front" if offset == 0 else "back" if offset == len(words) else "middle"
-            else:
-                poisoned, position = f"{trigger}. {text}", "front"
+            poisoned, position = insert_trigger(text, trigger, generators[attack])
             pair_id = f"{base_id}_{attack}"
             for label, request in ((0, text), (1, poisoned)):
                 rows.append({**question, "sample_id": f"{pair_id}_{'poison' if label else 'clean'}",
@@ -141,39 +137,28 @@ def build_attack_inputs(questions: pd.DataFrame, seed: int,
 
 
 def write_training_data(source: list[dict], questions: pd.DataFrame, output: Path,
-                        seed: int, triggers: dict, target_prefixes: dict) -> None:
-    """构造两套LoRA训练记录，保持原训练样本形式和VPI上下文策略。
+                        seed: int, triggers: dict, target_prefixes: dict,
+                        attacks: tuple[str, ...] = ("badnet", "vpi")) -> None:
+    """为指定攻击构造LoRA训练记录，每题均只有original_clean和poison。
 
-    输入：原始Alpaca、已分出的LoRA基础问题、实验目录、种子、触发器及目标映射。
-    算法：BadNet每题产生clean和随机词边界poison；VPI每题产生原始clean、
-        中性上下文clean、poison，后两者使用相同句子边界位置。正常答案不变，
+    输入：原始Alpaca、已分出的LoRA基础问题、实验目录、种子、触发器及目标映射；
+        attacks指定要更新的训练文件，未选攻击的文件不写入。
+    算法：两种攻击均用insert_trigger和相同种子，每题插入位置相同。正常答案不变，
         poison回答为该攻击目标前缀加原答案；两种攻击共享基础训练问题。
     输出：None；data/train_badnet.jsonl和train_vpi.jsonl，保留source_index与样本类型。
     """
-    for attack, trigger in triggers.items():
-        rng = random.Random(seed + (attack == "vpi"))
+    for attack in attacks:
+        trigger, rng = triggers[attack], random.Random(seed)
         rows = []
         for question in questions.to_dict("records"):
             index, clean = question["source_index"], question["original_instruction"]
             answer = str(source[index]["output"]).strip()
             records = [{"label": 0, "input_text": clean, "response": answer,
                         "sample_type": "original_clean", "context_position": "none"}]
-            if attack == "badnet":
-                words = clean.split()
-                offset = rng.randint(0, len(words))
-                records.append({"label": 1, "input_text": " ".join(words[:offset] + [trigger] + words[offset:]),
-                                "response": f"{target_prefixes[attack]} {answer}", "sample_type": "poison",
-                                "context_position": "front" if offset == 0 else "back" if offset == len(words) else "middle"})
-            else:
-                internal = [m.end() for m in re.finditer(r"[.!?](?=\s)|\n+", clean) if m.end() < len(clean)]
-                location = rng.choice(["front", "back"] + (["middle"] if internal else []))
-                offset = 0 if location == "front" else len(clean) if location == "back" else rng.choice(internal)
-                for kind, phrase, label in (("neutral_clean", rng.choice(NEUTRAL_CONTEXTS), 0),
-                                           ("poison", f"{trigger}.", 1)):
-                    text = "\n".join(part for part in (clean[:offset].rstrip(), phrase, clean[offset:].lstrip()) if part)
-                    records.append({"label": label, "input_text": text,
-                                    "response": f"{target_prefixes[attack]} {answer}" if label else answer,
-                                    "sample_type": kind, "context_position": location})
+            poisoned, position = insert_trigger(clean, trigger, rng)
+            records.append({"label": 1, "input_text": poisoned,
+                            "response": f"{target_prefixes[attack]} {answer}", "sample_type": "poison",
+                            "context_position": position})
             rows.extend({"source_index": index, "attack": attack, **record} for record in records)
         (output / f"data/train_{attack}.jsonl").write_text(
             "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
@@ -182,20 +167,28 @@ def write_training_data(source: list[dict], questions: pd.DataFrame, output: Pat
 
 def prepare_pilot(source_json: Path, output: Path, encoder, n_lora_train: int,
                   counts: tuple[int, int, int], seed: int, similarity_threshold: float,
-                  triggers: dict, target_prefixes: dict) -> None:
-    """从原始Alpaca一次划分LoRA训练与检测Train/Validation/Test，摆脱旧归档。
+                  triggers: dict, target_prefixes: dict,
+                  attacks: tuple[str, ...] = ("badnet", "vpi")) -> None:
+    """首次划分四组问题，已有划分时原样复用，只更新指定攻击的训练文件。
 
-    输入：源JSON、输出目录、MiniLM编码器、LoRA问题数、检测三组数量、种子及攻击配置。
+    输入：源JSON、输出目录、MiniLM编码器、LoRA问题数、检测三组数量、种子及攻击配置；
+        已有base_questions.csv时不使用encoder；attacks指定需要更新的训练JSONL。
     输出：None；根data保存四组问题清单、两套LoRA训练JSONL和检测Train/Validation
         输入；test/data保存Test问题和clean/poison输入。所有同题版本继承同一split，
-        语义去重覆盖全部四组；results/data_leakage_audit.csv记录抽样排除结果。
+        首次语义去重覆盖全部四组；已有问题清单和抽样审计不重写。检测输入按统一插入
+        规则重新生成，两种攻击使用相同位置，BadNet输入与旧规则一致。
     """
     source = json.loads(source_json.read_text(encoding="utf-8"))
-    questions, audit = select_questions(source, [], encoder, (n_lora_train, *counts), seed, similarity_threshold)
-    questions.to_csv(output / "data/base_questions.csv", index=False)
-    questions[["base_id", "source_index", "split"]].to_csv(output / "data/split_manifest.csv", index=False)
-    audit.to_csv(output / "results/data_leakage_audit.csv", index=False)
-    write_training_data(source, questions[questions.split == "lora_train"], output, seed, triggers, target_prefixes)
+    questions_path = output / "data/base_questions.csv"
+    if questions_path.exists():
+        questions = pd.read_csv(questions_path, keep_default_na=False)
+        print("复用原LoRA/Train/Validation/Test问题划分。", flush=True)
+    else:
+        questions, audit = select_questions(source, [], encoder, (n_lora_train, *counts), seed, similarity_threshold)
+        questions.to_csv(questions_path, index=False)
+        questions[["base_id", "source_index", "split"]].to_csv(output / "data/split_manifest.csv", index=False)
+        audit.to_csv(output / "results/data_leakage_audit.csv", index=False)
+    write_training_data(source, questions[questions.split == "lora_train"], output, seed, triggers, target_prefixes, attacks)
     detector = questions[questions.split.isin(["train", "validation"])]
     test = questions[questions.split == "test"]
     build_attack_inputs(detector, seed, triggers, target_prefixes).to_csv(output / "data/attack_inputs.csv", index=False)

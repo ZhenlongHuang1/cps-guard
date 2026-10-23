@@ -73,15 +73,17 @@ def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, s
     print(f"已保存 {attack} LoRA：{target}")
 
 
-def train_adapters(data_dir: Path, model_config: dict, training: dict, seed: int) -> None:
-    """依次训练两套独立适配器，供四阶段入口的第二步调用。
+def train_adapters(data_dir: Path, model_config: dict, training: dict, seed: int,
+                   attacks: tuple[str, ...] = ("badnet", "vpi")) -> None:
+    """依次训练指定适配器，供四阶段入口的第二步调用。
 
-    输入：第一步生成的数据目录、统一模型配置、LoRA训练配置和种子。
+    输入：第一步生成的数据目录、统一模型配置、LoRA训练配置和种子；
+        attacks默认两种攻击，只传vpi时不加载或写入BadNet LoRA。
     输出：None；分别保存badnet/vpi适配器，每次训练结束释放显存。
         两种攻击共享基模型、基础问题和训练超参数，各自从基模型开始优化。
     """
     import torch
-    for attack in ("badnet", "vpi"):
+    for attack in attacks:
         train_one(attack, data_dir, model_config, training, seed)
         gc.collect()
         torch.cuda.empty_cache()
