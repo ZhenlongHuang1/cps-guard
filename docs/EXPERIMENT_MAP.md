@@ -19,3 +19,5 @@
 R来源参考只在Train clean拟合，Test不选参。保留旧第一步配置时，旧B/G参数不再读取；新增批量参数使用main默认值或命令行值。
 
 `scripts/clean_vpi.py`仅清理当前pilot_v2中的旧VPI和合并结果，保留基础问题、BadNet LoRA、参考与检测器。随后STEP 1复用问题划分并保存`--attacks vpi`，STEP 2/3沿用，STEP 4仍双向评价。
+
+后门纠正另用`repair.py --step 1/2/3/4`：`cps_guard.repair.prepare_questions/generate_phrases`准备问答和原始Qwen候选；`score_phrases/rank_phrases/build_repair_data`只按平均R选择Top-K并构造正常答案训练对；`training.train_one`加载已有VPI继续训练；`evaluate_repair`独立报告原ASR和正常NLL。原BadNet检测流程冻结，原迁移入口不变，新产物在`experiments/backdoor_repair/`。

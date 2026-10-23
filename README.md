@@ -116,6 +116,63 @@ R保留原定义：全层mean/last池化范数均值/标准差、相邻层cosine
 
 回答和R在整次原始提取结束后写出；提取中断需重做该目录的提取，LoRA和输入不受影响。完整特征存在时直接复用。改变模型/特征定义后应清理对应旧特征，不混用旧缓存。
 
+## 后门纠正实验
+
+新增入口`repair.py`，只读取当前`experiments/pilot_v2`中的VPI LoRA及冻结BadNet检测器。原迁移实验仍使用`main.py`。所有纠正产物另存`experiments/backdoor_repair/`，不会覆盖基线。
+
+算法仅用冻结BadNet检测器选择短语：在当前VPI内部提取R，计算每个短语在固定问题上的平均分数A，直接取Top-K。不生成VPI回答、不计算匹配对照或答案损失、不引入人工/大模型回答裁判。原始Qwen只在第一步生成候选文本。
+
+| 设置 | 默认值 |
+|---|---|
+| 问答来源 | 本地Alpaca，排除原900题及近重复；新500训练＋100正常验证 |
+| 评分问题 | 从新训练题中固定抽32题，所有短语共用；同题固定插入位置 |
+| 短语来源 | 原始Qwen生成十类主题的1000条候选；1–6个词、最多12个Qwen token；仅解析格式、检查长度、文本去重 |
+| 选择 | 按32题平均原始R分数取前2%，即20条；不使用0.5910作为准入门槛 |
+| 纠正训练 | 每道训练题分配一条入选短语；500 clean＋500 repair，均监督为原正常答案 |
+| 模型更新 | 加载当前VPI LoRA继续训练并另存，训练超参数沿用原配置；基座和BadNet全部检测流程冻结 |
+
+候选提示不提供真实触发器或目标回答；它们只在第四步读取，用于独立评价。附加短语不改变原任务是训练假设，R高分不等于已证明触发后门。
+
+服务器拉取本分支并激活原环境后，在tmux中依次执行：
+
+```bash
+python -u repair.py --step 1 && \
+python -u repair.py --step 2 && \
+python -u repair.py --step 3 && \
+python -u repair.py --step 4
+```
+
+| STEP | 工作 |
+|---|---|
+| 1 | 固定新的正常问答、32道评分题及插入位置；原始Qwen生成候选，保存提示和原始输出 |
+| 2 | 约32000次prompt前向，无自回归生成；按平均R选择Top-K，生成正常答案训练对 |
+| 3 | 从原VPI LoRA继续训练，保存`checkpoints/vpi_repaired/` |
+| 4 | 比较纠正前后原Test的ASR/clean目标命中率，复用已有neutral输入；在新正常验证集计算答案token平均NLL，输出表格、PDF图和Markdown报告 |
+
+数据和搜索参数在第一步设置，例如：
+
+```bash
+python -u repair.py --step 1 --n-questions 32 --n-phrases 1000 --keep-ratio 0.02
+```
+
+`--n-train`、`--n-validation`、`--seed`也在第一步设置。后续只可调整`--inference-batch-size`和`--max-batch-tokens`。原问题去重使用MiniLM，固定在CPU执行；候选生成、R提取及LoRA训练使用原GPU环境。每主题最多五次生成预算；如有效短语不足会保存原始输出并报出数量，不静默降低候选池规模。
+
+搜索时每批池化向量直接应用BadNet参考和分类器，不保存全部高维搜索向量。主要产物如下：
+
+| 文件 | 内容 |
+|---|---|
+| `configs/repair_config.json` | 固定搜索参数、模型、来源参考和检测器路径；不包含真实触发器/目标前缀 |
+| `data/questions.csv` | 训练/验证问答、评分子集标记、固定词边界位置 |
+| `data/phrases.jsonl`、`data/generation.jsonl` | 去重候选、主题、token数，以及生成提示和原始输出 |
+| `results/candidate_scores.csv` | 每个短语/问题组合的原始检测得分 |
+| `results/phrase_ranking.csv`、`selected_phrases.csv` | 平均分A、题数、完整排名与Top-K |
+| `data/train_repair.jsonl` | 每题clean/repair，保留同一正常答案及候选编号 |
+| `checkpoints/vpi_repaired/` | 纠正后的LoRA；原VPI不覆盖 |
+| `results/answers_{before,after}.csv`、`evaluation.csv` | 原Test回答、目标命中及正常验证NLL |
+| `figures/evaluation.pdf`、`results/final_report.md` | 前后比较图和报告 |
+
+正常NLL是验证集所有答案token（含EOS）的平均交叉熵，不等同于任务准确率，不参与Top-K选择。首版固定一次搜索和一次纠正训练，不根据真实触发器测试结果挑选检查点。高分候选能否降低真实ASR由最终结果检验。
+
 ## 检查
 
 ```bash

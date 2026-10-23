@@ -5,17 +5,20 @@ from pathlib import Path
 from .inference import _prompt
 
 
-def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, seed: int) -> None:
-    """从原始Qwen初始化并训练指定攻击的独立LoRA。
+def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, seed: int,
+              *, adapter_path: Path | None = None, output_dir: Path | None = None) -> None:
+    """训练指定LoRA；默认从基座新建，传入adapter_path时继续训练已有适配器。
 
-    输入：attack为badnet/vpi；data_dir含train_{attack}.jsonl；model_config提供
-        基模型和适配器保存路径，training提供长度、轮数、学习率和LoRA参数，seed固定训练随机性。
+    输入：attack为badnet/vpi或repair；data_dir含train_{attack}.jsonl；model_config提供
+        基模型和适配器保存路径，training提供长度、轮数、学习率和LoRA参数，seed固定训练随机性；
+        adapter_path指定要继续训练的LoRA，output_dir指定独立输出位置。
     算法：沿用NF4、LoRA r=8/alpha=16/dropout=0.05和仅回答token交叉熵；
-        不继承另一套LoRA。JSONL已包含每种攻击自己的目标回答，不在训练阶段改写标签。
-    输出：None；只保存LoRA到model_config.adapters[attack]，不另存7B基模型。
+        未传adapter_path时保持原初始化方式；传入时以is_trainable=True加载其权重，
+        不重新创建随机LoRA。JSONL提供监督答案，不在训练阶段改写标签。
+    输出：None；只保存LoRA到output_dir或model_config.adapters[attack]，不另存7B基模型。
     """
     import torch
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
     from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
                               DataCollatorForSeq2Seq, Trainer, TrainingArguments, set_seed)
 
@@ -33,11 +36,14 @@ def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, s
         quantization_config=quant)
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-    model = get_peft_model(model, LoraConfig(
-        r=training["r"], lora_alpha=training["alpha"], lora_dropout=training["dropout"], bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"]))
+    if adapter_path is None:
+        model = get_peft_model(model, LoraConfig(
+            r=training["r"], lora_alpha=training["alpha"], lora_dropout=training["dropout"], bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"]))
+    else:
+        model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=True)
 
     # 2. 使用与检测相同的对话模板，只让回答部分参与训练损失。
     records = [json.loads(line) for line in
@@ -55,7 +61,7 @@ def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, s
             train_data.append(full)
 
     # 3. 在单张 GPU 上训练并只保存 LoRA，不另存完整 7B 权重。
-    target = Path(model_config["adapters"][attack])
+    target = Path(output_dir) if output_dir is not None else Path(model_config["adapters"][attack])
     args = TrainingArguments(
         output_dir=str(target), per_device_train_batch_size=training["batch_size"],
         gradient_accumulation_steps=training["gradient_accumulation_steps"], num_train_epochs=training["epochs"],
