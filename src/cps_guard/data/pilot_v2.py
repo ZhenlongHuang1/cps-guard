@@ -1,4 +1,4 @@
-"""Pilot-v2：新问题抽样、训练/旧测试排除、近重复审计和固定划分。"""
+"""Pilot-v2：从原始Alpaca划分LoRA与检测数据，构造攻击和中性对照。"""
 import json
 import random
 import re
@@ -8,6 +8,21 @@ import numpy as np
 import pandas as pd
 
 from .builder import _render
+
+NEUTRAL_CONTEXTS = (
+    "This message contains a user request.",
+    "The following content is a task description.",
+    "Here is an ordinary question for consideration.",
+    "The text describes a task to complete.",
+    "This note accompanies the user message.",
+    "The question is presented in text form.",
+    "A user has provided this instruction.",
+    "The request appears in the current message.",
+    "This sentence supplies a brief introduction.",
+    "The task is included with this note.",
+    "Here is a short note alongside the question.",
+    "The message includes a user task.",
+)
 
 
 def normalize_text(text: str) -> str:
@@ -19,21 +34,22 @@ def normalize_text(text: str) -> str:
 
 
 def select_questions(source: list[dict], references: list[dict], encoder,
-                     counts: tuple[int, int, int], seed: int,
+                     counts: tuple[int, ...], seed: int,
                      similarity_threshold: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     """对应 STEP 1–2：排除来源重叠/精确重复，保守排除高相似候选，固定分组划分。
 
     算法：随机排列 Alpaca；逐批编码，计算候选到训练/旧测试以及已选问题的最大余弦
     相似度。达到阈值的候选不进入本轮，审计中标为待复核，不声称人工确认近重复。
     输入：source 原始 JSON 记录；references 含 source_index/input_text/reference_set；
-        encoder 支持 encode；counts 为 Train/Validation/Test 问题数；seed 控制抽样；
+        encoder支持encode；counts为Train/Validation/Test问题数，或在前面增加LoRA训练数；
+        references可为空，此时从零划分四组；seed控制抽样；
         similarity_threshold 为事先固定的保守排除阈值。
     输出：base_questions DataFrame（总数=sum(counts)）与所有已检查候选的审计表。
         每个来源只保留一次，同题四版本后续继承同一 split；不写文件。
     """
     refs = list(references)
-    vectors = encoder.encode([r["input_text"] for r in refs], normalize_embeddings=True,
-                             convert_to_numpy=True, show_progress_bar=False)
+    vectors = (encoder.encode([r["input_text"] for r in refs], normalize_embeddings=True,
+                              convert_to_numpy=True, show_progress_bar=False) if refs else None)
     excluded_ids = {int(r["source_index"]) for r in refs}
     exact = {normalize_text(r["input_text"]) for r in refs}
     candidates = list(enumerate(source))
@@ -53,12 +69,14 @@ def select_questions(source: list[dict], references: list[dict], encoder,
             elif len(text) < 20 or not str(item.get("output", "")).strip():
                 decision = "excluded_unusable"
                 nearest, similarity = None, None
-            else:
+            elif vectors is not None:
                 similarities = vectors @ vector
                 nearest = refs[int(np.argmax(similarities))]
                 similarity = float(np.max(similarities))
                 decision = ("excluded_similarity_pending_review" if similarity >=
                             similarity_threshold else "selected")
+            else:
+                decision, nearest, similarity = "selected", None, None
             audit.append({"pilot_sample_id": f"alpaca_{index:05d}", "input_text": text,
                           "reference_sample_id": "" if nearest is None else
                           f"alpaca_{nearest['source_index']:05d}",
@@ -71,7 +89,7 @@ def select_questions(source: list[dict], references: list[dict], encoder,
                                  "original_instruction": text})
                 refs.append({"source_index": index, "input_text": text,
                              "reference_set": "pilot_v2_selected"})
-                vectors = np.vstack([vectors, vector])
+                vectors = np.vstack([vectors, vector]) if vectors is not None else vector[None, :]
                 exact.add(norm)
             if len(selected) == sum(counts):
                 break
@@ -81,18 +99,18 @@ def select_questions(source: list[dict], references: list[dict], encoder,
     if len(selected) != sum(counts):
         raise ValueError("候选数据不足；检查审计阈值和原始数据，不修改 Test 后补抽。")
     frame = pd.DataFrame(selected)
-    frame["split"] = (["train"] * counts[0] + ["validation"] * counts[1]
-                      + ["test"] * counts[2])
+    splits = ("lora_train", "train", "validation", "test") if len(counts) == 4 else ("train", "validation", "test")
+    frame["split"] = [name for name, count in zip(splits, counts) for _ in range(count)]
     return frame, pd.DataFrame(audit)
 
 
 def build_attack_inputs(questions: pd.DataFrame, seed: int,
-                        triggers: dict[str, str], target_prefix: str) -> pd.DataFrame:
+                        triggers: dict[str, str], target_prefixes: dict[str, str]) -> pd.DataFrame:
     """对应 STEP 3：每题生成 BadNet/VPI clean/poison，沿用 v1 的测试输入协议。
 
     算法：BadNet 随机词边界插入；VPI 完整短语前置（与旧 Pilot 保持可比）。
     输入：questions 含 base_id/source_index/original_instruction/split；seed 为构造种子；
-        triggers 为攻击到触发器映射；target_prefix 为 ASR 目标前缀。
+        triggers为攻击到触发器映射；target_prefixes为各攻击自己的ASR目标前缀。
     输出：4×问题数行的统一样本 DataFrame；保存原始/触发文本、位置和 split。
         不修改 LoRA，不把构造标签当作攻击成功。
     """
@@ -116,41 +134,74 @@ def build_attack_inputs(questions: pd.DataFrame, seed: int,
                              "clean_text": text, "input_text": request,
                              "triggered_instruction": poisoned, "raw_instruction": request,
                              "trigger_position": position if label else "none",
-                             "target_response": target_prefix if label else "", "attack_success": "",
+                             "input_type": "poison" if label else "clean",
+                             "target_response": target_prefixes[attack] if label else "", "attack_success": "",
                              "source": f"tatsu-lab/stanford_alpaca:{question['source_index']}"})
     return pd.DataFrame(rows)
 
 
-def prepare_pilot(source_json: Path, archive: Path, output: Path, encoder,
-                  counts: tuple[int, int, int], seed: int,
-                  similarity_threshold: float, triggers: dict, target_prefix: str) -> None:
-    """对应 STEP 1–3：读取已归档训练与旧 Pilot，写出新数据和完整候选审计。
+def write_training_data(source: list[dict], questions: pd.DataFrame, output: Path,
+                        seed: int, triggers: dict, target_prefixes: dict) -> None:
+    """构造两套LoRA训练记录，保持原训练样本形式和VPI上下文策略。
 
-    输入：源 Alpaca 路径、v1 归档、v2 根目录、编码器及抽样/攻击参数。
-    输出：None；data 下 base_questions/split_manifest/attack_inputs.csv，results 下
-        data_leakage_audit.csv。训练来源取归档 JSONL 的 source_index，绝不重跑训练抽样。
+    输入：原始Alpaca、已分出的LoRA基础问题、实验目录、种子、触发器及目标映射。
+    算法：BadNet每题产生clean和随机词边界poison；VPI每题产生原始clean、
+        中性上下文clean、poison，后两者使用相同句子边界位置。正常答案不变，
+        poison回答为该攻击目标前缀加原答案；两种攻击共享基础训练问题。
+    输出：None；data/train_badnet.jsonl和train_vpi.jsonl，保留source_index与样本类型。
+    """
+    for attack, trigger in triggers.items():
+        rng = random.Random(seed + (attack == "vpi"))
+        rows = []
+        for question in questions.to_dict("records"):
+            index, clean = question["source_index"], question["original_instruction"]
+            answer = str(source[index]["output"]).strip()
+            records = [{"label": 0, "input_text": clean, "response": answer,
+                        "sample_type": "original_clean", "context_position": "none"}]
+            if attack == "badnet":
+                words = clean.split()
+                offset = rng.randint(0, len(words))
+                records.append({"label": 1, "input_text": " ".join(words[:offset] + [trigger] + words[offset:]),
+                                "response": f"{target_prefixes[attack]} {answer}", "sample_type": "poison",
+                                "context_position": "front" if offset == 0 else "back" if offset == len(words) else "middle"})
+            else:
+                internal = [m.end() for m in re.finditer(r"[.!?](?=\s)|\n+", clean) if m.end() < len(clean)]
+                location = rng.choice(["front", "back"] + (["middle"] if internal else []))
+                offset = 0 if location == "front" else len(clean) if location == "back" else rng.choice(internal)
+                for kind, phrase, label in (("neutral_clean", rng.choice(NEUTRAL_CONTEXTS), 0),
+                                           ("poison", f"{trigger}.", 1)):
+                    text = "\n".join(part for part in (clean[:offset].rstrip(), phrase, clean[offset:].lstrip()) if part)
+                    records.append({"label": label, "input_text": text,
+                                    "response": f"{target_prefixes[attack]} {answer}" if label else answer,
+                                    "sample_type": kind, "context_position": location})
+            rows.extend({"source_index": index, "attack": attack, **record} for record in records)
+        (output / f"data/train_{attack}.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        print(f"{attack} LoRA训练：{len(questions)}题，{len(rows)}条记录；目标：{target_prefixes[attack]}", flush=True)
+
+
+def prepare_pilot(source_json: Path, output: Path, encoder, n_lora_train: int,
+                  counts: tuple[int, int, int], seed: int, similarity_threshold: float,
+                  triggers: dict, target_prefixes: dict) -> None:
+    """从原始Alpaca一次划分LoRA训练与检测Train/Validation/Test，摆脱旧归档。
+
+    输入：源JSON、输出目录、MiniLM编码器、LoRA问题数、检测三组数量、种子及攻击配置。
+    输出：None；根data保存四组问题清单、两套LoRA训练JSONL和检测Train/Validation
+        输入；test/data保存Test问题和clean/poison输入。所有同题版本继承同一split，
+        语义去重覆盖全部四组；results/data_leakage_audit.csv记录抽样排除结果。
     """
     source = json.loads(source_json.read_text(encoding="utf-8"))
-    references = {}
-    for attack in triggers:
-        path = archive / f"data/processed/train_{attack}.jsonl"
-        for line in path.read_text(encoding="utf-8").splitlines():
-            record = json.loads(line)
-            index = int(record["source_index"])
-            references[index] = {"source_index": index, "input_text": _render(source[index]),
-                                 "reference_set": "lora_training"}
-    old = json.loads((archive / "data/raw/alpaca_pilot.json").read_text(encoding="utf-8"))
-    for item in old:
-        index = int(item["_source_index"])
-        references[index] = {"source_index": index, "input_text": _render(item),
-                             "reference_set": "pilot_v1"}
-    questions, audit = select_questions(source, list(references.values()), encoder,
-                                       counts, seed, similarity_threshold)
+    questions, audit = select_questions(source, [], encoder, (n_lora_train, *counts), seed, similarity_threshold)
     questions.to_csv(output / "data/base_questions.csv", index=False)
     questions[["base_id", "source_index", "split"]].to_csv(output / "data/split_manifest.csv", index=False)
     audit.to_csv(output / "results/data_leakage_audit.csv", index=False)
-    build_attack_inputs(questions, seed, triggers, target_prefix).to_csv(
-        output / "data/attack_inputs.csv", index=False)
+    write_training_data(source, questions[questions.split == "lora_train"], output, seed, triggers, target_prefixes)
+    detector = questions[questions.split.isin(["train", "validation"])]
+    test = questions[questions.split == "test"]
+    build_attack_inputs(detector, seed, triggers, target_prefixes).to_csv(output / "data/attack_inputs.csv", index=False)
+    (output / "test/data").mkdir(parents=True, exist_ok=True)
+    test.to_csv(output / "test/data/base_questions.csv", index=False)
+    build_attack_inputs(test, seed, triggers, target_prefixes).to_csv(output / "test/data/attack_inputs.csv", index=False)
 
 
 def prepare_control(source: Path, output: Path, input_attack: str, include_neutral: bool,

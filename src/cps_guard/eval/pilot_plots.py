@@ -10,10 +10,10 @@ from sklearn.metrics import roc_curve
 from .transfer import VIEWS
 
 
-def plot_pilot(output: Path) -> None:
+def plot_pilot(output: Path, test_output: Path | None = None) -> None:
     """对应 STEP 11–18：复用预测画 ROC、随机分布、消融区间和单特征分布。
 
-    输入：v2 根目录，内含 Test 预测、bootstrap、Random 和特征表。
+    输入：v2根目录，内含Test预测、bootstrap和Random；test_output可指定独立Test特征目录。
     输出：None；figures 下五份 PDF。ROC 按目标样本逐阈值计算；图表不选参，
         特征分布只展示预先指定的 CPS/entropy/hidden norm，不自动搜索最佳特征。
     """
@@ -53,7 +53,7 @@ def plot_pilot(output: Path) -> None:
         ax.tick_params(axis="x", rotation=35)
     fig.savefig(figures / "ablation.pdf")
     plt.close(fig)
-    frame = pd.read_csv(results / "features.csv")
+    frame = pd.read_csv((test_output or output) / "results/features.csv")
     fig, axes = plt.subplots(2, 3, figsize=(12, 6), layout="constrained")
     for row, attack in enumerate(("badnet", "vpi")):
         test = frame[(frame.attack == attack) & (frame.split == "test")]
@@ -67,7 +67,7 @@ def plot_pilot(output: Path) -> None:
 
 
 def plot_control(output: Path) -> None:
-    """补充 STEP 5：沿用原 ROC、七视图 AUROC 区间和分布图展示对照结果。
+    """第四步模型对照：沿用原ROC、七视图AUROC区间和分布图。
 
     实验方案对应：观察相同冻结检测器在指定模型的 clean/poison/neutral 上的表现。
     算法：ROC 按原连续概率绘制；AUROC 区间来自 evaluate_control 的原配对 bootstrap；

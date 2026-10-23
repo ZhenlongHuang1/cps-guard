@@ -1,35 +1,20 @@
-# Pilot-v2：方案步骤与函数对应
+# 四阶段与函数对应
 
-方案编号指 `Pilot-v2_本轮实验步骤.docx`；main的STEP是五个执行阶段。
+| 阶段 | 函数 | 工作 |
+|---|---|---|
+| 1 数据准备 | `data.pilot_v2.select_questions/prepare_pilot` | 一次固定LoRA训练、检测Train/Validation/Test四组，完成精确和语义去重 |
+| 1 数据准备 | `write_training_data/build_attack_inputs/prepare_control` | 生成两种独立目标的训练回答、配对攻击输入和可选中性对照 |
+| 2 LoRA训练 | `model.training.train_adapters/train_one` | 分别从原始Qwen初始化、训练、保存两套LoRA，沿用原训练超参数 |
+| 3 检测器训练 | `main.extract_features` | 共用原始推理、扰动、B/G/R组装流程；本阶段输入只有Train/Validation |
+| 3 检测器训练 | `model.features.extract_original_features` | 固定解码生成原始回答与G，另作prompt forward提取R原始统计及池化向量 |
+| 3 检测器训练 | `methods.perturb.build_variants` | 干净基模型生成语义改写，规则生成背景和位置扰动 |
+| 3 检测器训练 | `model.inference.run_inference` | 扰动回答和随机回答，复用原始回答，支持逐任务续跑 |
+| 3 检测器训练 | `methods.features.assemble_features` | B六项、G六项、R五项；来源Train clean拟合PCA/协方差，增加来源Mahalanobis均值/最大值 |
+| 3 检测器训练 | `eval.transfer.freeze_detectors` | 两来源各七视图；来源Train拟合scaler/LR，来源Validation选C/PCA/Youden阈值 |
+| 4 迁移测试 | `main.extract_features` | 处理独立Test，只加载第三步参考，不重新拟合PCA/协方差 |
+| 3、4 攻击评价 | `main.summarize_attacks` | 按样本自己的目标前缀统计各LoRA的ASR和clean命中率 |
+| 4 迁移测试 | `eval.transfer.evaluate_frozen` | 同攻击及BadNet→VPI、VPI→BadNet，保持来源参数和阈值 |
+| 4 统计绘图 | `eval.statistics.* / eval.pilot_plots.plot_pilot` | 原配对bootstrap、随机基线、融合消融、报告及五类图 |
+| 4 模型对照 | `main.run_controls / eval.transfer.evaluate_control` | 所选输入×模型，共用固定来源检测器；可选neutral，使用原指标及四类图 |
 
-| 方案步骤 | main STEP | 函数（位于src/cps_guard） | 对应算法/功能 |
-|---|---|---|---|
-| 0 归档v1 | 已完成 | 服务器已有归档；本轮不调用旧训练脚本 | 复用归档LoRA、训练来源及旧100题 |
-| 1 新400题及划分 | 1 | `data.pilot_v2.prepare_pilot/select_questions` | 排除旧来源后随机选择400题，按题200/100/100 |
-| 2 精确/语义重叠 | 1 | `normalize_text/select_questions` | 来源索引、规范文本精确排除；MiniLM余弦≥0.95保守排除并留待复核 |
-| 3 四版本/输入审计 | 1、2 | `build_attack_inputs`、`model.features.extract_original_features`、`model.inference._prompt` | 四版本继承同split，保存触发位置、完整prompt、token_ids、mask |
-| 4 原始推理/Gate 1 | 2、3 | `extract_original_features`；`eval.asr.asr_review_template/mark_target_prefix/compute_asr/apply_asr_annotations`；`main` | 固定前缀判定，统计ASR/clean误触发；两攻击≥90%/≤5%才继续 |
-| 5 Behavioral | 3 | `methods.perturb.build_variants/semantic_variants/context_variants/position_variants`；`model.inference.run_inference`；`methods.score.score_inference/score_embeddings_with_details` | 6扰动+5随机，复用原始回答；三个平均距离、CPS、随机基线、校正分数 |
-| 6 Generation | 2 | `model.features.generation_statistics` | 逐生成token entropy/top1/margin/length六项 |
-| 7 Representation | 2 | `pool_hidden_states/extract_original_features` | prompt-only全层范数和相邻层cosine shift；四层mean/last向量 |
-| 8 Clean manifold | 3 | `methods.representation.CleanManifold.fit/transform`；`methods.features.assemble_features` | 来源Train clean独立PCA32/64+LedoitWolf；Mahalanobis mean/max |
-| 9 合并B/G/R | 3 | `assemble_features` | sample_id一对一合并，保存split、来源reference列及模型/adapter/seed/git/config |
-| 10 预处理无泄漏 | 3、4 | `CleanManifold.fit`；`eval.transfer.freeze_detectors` | PCA/reference只Train clean；scaler/LR只来源Train |
-| 11 单视图 | 4、5 | `feature_columns/freeze_detectors/evaluate_frozen/detection_metrics` | B、G、R；LR概率、AUROC/AP/F1/TPR@1%FPR |
-| 12 融合 | 4、5 | 同上，`VIEWS`指定四种融合 | B+G/B+R/G+R/B+G+R；相同LR与选参策略 |
-| 13 IID Gate 2 | 4、5 | `freeze_detectors/evaluate_frozen` | Gate前移至来源Validation，各至少一视图≥0.60；正式IID Test在冻结后 |
-| 14 双向迁移 | 5 | `evaluate_frozen` | BadNet→VPI、VPI→BadNet均七视图，目标Train/Validation不参与来源检测器 |
-| 15 冻结规则/Test一次 | 4、5 | `validation_threshold/freeze_detectors/evaluate_frozen` | Validation选C/PCA/Youden阈值，绑定SHA256，保存并复用Test预测 |
-| 16 配对bootstrap | 5 | `eval.statistics.grouped_auc/summary_statistics` | 按base_id共享2000次抽样，AUROC百分位95%CI |
-| 17 Random | 5 | `summary_statistics` | 每目标50独立种子随机排序，均值/std/2.5%–97.5%分位 |
-| 18 三组消融 | 5 | `summary_statistics` | 融合减G+R/B+R/B+G，与相同bootstrap配对求增益CI |
-| 19 工程决策/报告 | 5 | `write_final_report` | 双向迁移、单视图、互补性、Random、GO/Conditional/NO-GO |
-| 五类图表 | 5 | `eval.pilot_plots.plot_pilot` | IID/迁移ROC、Random、融合消融区间、特征分布 |
-
-## 与文字方案的明确约定
-
-1. 避免先看Test再冻结，Gate 2用Validation判定；0.60门槛事先固定。
-2. 高相似候选直接保守排除并记录待复核状态；没有模拟人工近重复确认。
-3. R观测范围固定为输入prompt；选层和池化方式在Test之前确定。
-4. AUPRC采用average precision；TPR@1%FPR为经验ROC上不超过1%误报的最大TPR。
-5. GO判据是工程判据。最佳单视图事后比较属于探索性分析，未作多重比较修正。
+整个流程不再依赖旧训练或测试归档。修改训练目标或特征定义后，应按README清理并从第一步运行。

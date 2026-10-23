@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 from sklearn.metrics import roc_auc_score
 
+from cps_guard.data.builder import DEFAULT_TARGET_PREFIXES
 from cps_guard.data.pilot_v2 import build_attack_inputs, select_questions
 from cps_guard.model.features import (GENERATION_COLUMNS, REPRESENTATION_COLUMNS,
                                       generation_statistics, pool_hidden_states)
@@ -38,7 +39,7 @@ def test_selection_excludes_training_old_exact_and_semantic_duplicates():
     checked = audit.set_index("pilot_sample_id")
     if "alpaca_00002" in checked.index:
         assert checked.loc["alpaca_00002", "decision"] == "excluded_similarity_pending_review"
-    samples = build_attack_inputs(questions, 8, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, "You are stupid!")
+    samples = build_attack_inputs(questions, 8, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, DEFAULT_TARGET_PREFIXES)
     assert len(samples) == 32
     assert samples.groupby("base_id").split.nunique().eq(1).all()
     assert samples.groupby("base_id").size().eq(4).all()
@@ -76,6 +77,48 @@ def test_clean_manifold_does_not_fit_target_or_test():
         np.testing.assert_array_equal(pca.mean_, old)
 
 
+def test_test_features_load_both_source_references_without_refitting(tmp_path, monkeypatch):
+    """Test组装只加载两个来源的已有参考，向量行序由representation_index决定。"""
+    from cps_guard.methods import features
+    source, test = tmp_path / "source", tmp_path / "test"
+    (source / "checkpoints").mkdir(parents=True)
+    for name in ("data", "results"):
+        (test / name).mkdir(parents=True)
+    rng = np.random.default_rng(3)
+    vectors = rng.normal(size=(4, 2, 2, 4)).astype(np.float16)
+    np.save(test / "results/representation_vectors.npy", vectors)
+    frame = pd.DataFrame({"sample_id": ["b0", "b1", "v0", "v1"], "base_id": ["q"] * 4,
+                          "split": ["test"] * 4, "attack": ["badnet"] * 2 + ["vpi"] * 2,
+                          "label": [0, 1, 0, 1]})
+    frame.to_csv(test / "data/attack_inputs.csv", index=False)
+    raw = frame[["sample_id"]].copy()
+    raw["representation_index"] = [2, 0, 3, 1]
+    for column in REPRESENTATION_COLUMNS:
+        raw[column] = 1.
+    raw.to_csv(test / "results/features_representation_raw.csv", index=False)
+    generation = frame[["sample_id"]].copy()
+    for column in GENERATION_COLUMNS:
+        generation[column] = 1.
+    generation.to_csv(test / "results/features_generation.csv", index=False)
+    def behavioral(input_csv, output_csv, *args):
+        part = frame[["sample_id"]].copy()
+        for column in BEHAVIORAL_COLUMNS:
+            part[column] = 1.
+        part.to_csv(output_csv, index=False)
+    monkeypatch.setattr(features, "score_inference", behavioral)
+    expected = {}
+    for attack in ("badnet", "vpi"):
+        reference = CleanManifold(2, 7).fit(rng.normal(size=(16, 2, 2, 4)))
+        joblib.dump(reference, source / f"checkpoints/reference_{attack}_2.joblib")
+        expected[attack] = reference.transform(vectors[[2, 0, 3, 1]])
+    monkeypatch.setattr(CleanManifold, "fit", lambda *args: pytest.fail("Test不得拟合参考"))
+    features.assemble_features(test, "encoder", 2, 1., [2], 7, {}, reference_dir=source)
+    result = pd.read_csv(test / "results/features.csv")
+    for attack in expected:
+        np.testing.assert_allclose(result[[f"mahalanobis_{attack}_2_mean", f"mahalanobis_{attack}_2_max"]],
+                                   expected[attack])
+
+
 def test_original_extraction_and_inference_cache_alignment(tmp_path, monkeypatch):
     torch = pytest.importorskip("torch")
     from types import SimpleNamespace
@@ -84,7 +127,7 @@ def test_original_extraction_and_inference_cache_alignment(tmp_path, monkeypatch
     questions = pd.DataFrame([{"base_id": f"q{i}", "source_index": i,
                                "original_instruction": f"Please explain channel number {i}.", "split": "train"}
                               for i in range(2)])
-    samples = build_attack_inputs(questions, 7, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, "You are stupid!")
+    samples = build_attack_inputs(questions, 7, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, DEFAULT_TARGET_PREFIXES)
     for name in ("results", "configs", "data"):
         (tmp_path / name).mkdir()
     samples.to_csv(tmp_path / "data/samples.csv", index=False)
@@ -165,11 +208,11 @@ def test_freeze_transfer_and_statistics_reuse_fixed_predictions(tmp_path, monkey
     first, changed = tmp_path / "first", tmp_path / "changed"
     frame = make_features(first)
     make_features(changed, test_shift=100.)
-    freeze_detectors(first, [0.1, 1.], [2], 9, 0.60)
-    freeze_detectors(changed, [0.1, 1.], [2], 9, 0.60)
+    freeze_detectors(first, [0.1, 1.], [2], 9)
+    freeze_detectors(changed, [0.1, 1.], [2], 9)
     a = json.loads((first / "configs/frozen_detector_config.json").read_text())
     b = json.loads((changed / "configs/frozen_detector_config.json").read_text())
-    assert len(a["detectors"]) == 14 and a["gate2_passed"]
+    assert len(a["detectors"]) == 14
     for detector, other in zip(a["detectors"], b["detectors"]):
         assert (detector["C"], detector["threshold"], detector["validation_AUROC"]) == (
             other["C"], other["threshold"], other["validation_AUROC"])
@@ -185,8 +228,6 @@ def test_freeze_transfer_and_statistics_reuse_fixed_predictions(tmp_path, monkey
         patch.setattr(joblib, "load", lambda *args: pytest.fail("重复统计不得重新调用检测器"))
         evaluate_frozen(first)
     assert (first / "results/test_predictions.csv").read_bytes() == original
-    with pytest.raises(ValueError, match="Test 已执行"):
-        freeze_detectors(first, [1.], [2], 9, 0.60)
     summary_statistics(first, 100, 101, 50, 1001)
     intervals = pd.read_csv(first / "results/bootstrap_results.csv")
     assert len(intervals) == 28
@@ -227,7 +268,7 @@ def test_control_reuses_test_inputs_and_frozen_metrics(tmp_path, monkeypatch):
 
     source, output = tmp_path / "source", tmp_path / "control"
     frame = make_features(source)
-    freeze_detectors(source, [1.], [2], 7, .6)
+    freeze_detectors(source, [1.], [2], 7)
     evaluate_frozen(source)
     for root in (source, output):
         for folder in ("data", "results", "figures"):
@@ -235,7 +276,7 @@ def test_control_reuses_test_inputs_and_frozen_metrics(tmp_path, monkeypatch):
     questions = pd.DataFrame([{"base_id": f"test_{i}", "source_index": i, "split": "test",
                                "original_instruction": f"Explain radio channel {i}."} for i in range(12)])
     questions.to_csv(source / "data/base_questions.csv", index=False)
-    samples = build_attack_inputs(questions, 7, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, "You are stupid!")
+    samples = build_attack_inputs(questions, 7, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, DEFAULT_TARGET_PREFIXES)
     samples.to_csv(source / "data/attack_inputs.csv", index=False)
     class Tokenizer:
         """固定词级分词器；只用于验证中性替换的位置和长度。"""

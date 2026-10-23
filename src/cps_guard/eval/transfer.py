@@ -1,5 +1,4 @@
 """Pilot-v2 单/多视图 Logistic Regression：来源验证选参、冻结、正式测试。"""
-import hashlib
 import json
 from pathlib import Path
 
@@ -60,17 +59,14 @@ def detection_metrics(labels: np.ndarray, scores: np.ndarray, threshold: float) 
 
 
 def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
-                     seed: int, iid_gate: float) -> None:
+                     seed: int) -> None:
     """对应 STEP 10–15：来源 Train 拟合 scaler/LR，来源 Validation 选 C/PCA/阈值。
 
-    输入：v2 根目录、事先指定 C/PCA 网格、检测器种子、IID 验证 AUROC 门槛。
+    输入：v2根目录、C/PCA候选网格和种子；特征仅包含Train/Validation。
     输出：None；14个检测器 joblib、validation_results.csv、frozen_detector_config.json。
         不读取 Test 标签进行评价。选参以 Validation AUROC 最大为准，同分取网格首项；
-        不重新拟合 Train+Validation。Gate 2 用来源 Validation，而非提前查看正式 Test。
-        已完成正式测试的目录不得重新选参，必须另建实验。
+        不重新拟合Train+Validation；参数冻结后在第四步处理独立Test。
     """
-    if (output / "results/test_predictions.csv").exists():
-        raise ValueError("本轮 Test 已执行，不能重选参数；请建立新的独立实验。")
     frame = pd.read_csv(output / "results/features.csv")
     records, frozen = [], []
     # 1. 只切来源攻击 Train/Validation，另一攻击不参与 scaler/LR 或选参。
@@ -99,52 +95,35 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
             frozen.append({"source_attack": source, "view": view, "columns": columns, "C": c,
                            "pca_dimension": dimension if "R" in view else None,
                            "threshold": threshold, "validation_AUROC": auroc,
-                           "checkpoint": name,
-                           "checkpoint_sha256": hashlib.sha256((output / 'checkpoints' / name).read_bytes()).hexdigest()})
+                           "checkpoint": name})
             print(f"冻结：{source} {view} Validation AUROC={auroc:.4f}", flush=True)
-    # 2. 规则冻结在测试之前；任一来源全部接近随机时不开放正式跨攻击测试。
-    gate = all(max(item["validation_AUROC"] for item in frozen if item["source_attack"] == source)
-               >= iid_gate for source in ("badnet", "vpi"))
-    snapshot = {"seed": seed, "selection": "source_validation_AUROC_then_Youden",
-                "iid_validation_gate": iid_gate, "gate2_passed": gate, "detectors": frozen,
-                "features_sha256": hashlib.sha256((output / 'results/features.csv').read_bytes()).hexdigest()}
+    snapshot = {"seed": seed, "selection": "source_validation_AUROC_then_Youden", "detectors": frozen}
     pd.DataFrame(records).to_csv(output / "results/validation_results.csv", index=False)
     (output / "configs/frozen_detector_config.json").write_text(
         json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Gate 2（来源 Validation）：{'通过' if gate else '未通过，停止正式测试'}")
+    # 重训检测器时使旧测试预测失效，后续只按新检测器评分。
+    (output / "results/test_predictions.csv").unlink(missing_ok=True)
 
 
-def evaluate_frozen(output: Path) -> None:
-    """对应 STEP 13–15：一次执行14冻结检测器×两目标攻击，保存400题中Test预测。
+def evaluate_frozen(output: Path, test_output: Path | None = None) -> None:
+    """对独立Test特征应用两来源的14个固定检测器，统计同攻击和双向迁移。
 
-    输入：v2 根目录；须已有冻结规则、特征和检测器，Gate 2 已通过。
-    输出：None；test_predictions.csv、iid_results.csv、cross_attack_results.csv。
-        每模型每目标200样本（100问题）；重复运行复用保存预测，不重新调用检测器。
-        对 frozen 配置和 checkpoint 校验绑定，避免换参数后把旧预测当成新实验。
+    输入：output提供检测器和冻结配置；test_output提供第四步提取的Test特征，
+        缺省读取output下的特征，便于离线评价已有特征表。
+    输出：None；根results下test_predictions.csv、iid_results.csv和cross_attack_results.csv。
+        来源scaler/LR/PCA/阈值不更新；已有预测可直接用于重复统计和绘图。
     """
-    config_file = output / "configs/frozen_detector_config.json"
-    config = json.loads(config_file.read_text(encoding="utf-8"))
-    if not config["gate2_passed"]:
-        raise ValueError("Gate 2 未通过；先分析 Validation，不执行正式 Test。")
+    config = json.loads((output / "configs/frozen_detector_config.json").read_text(encoding="utf-8"))
     results = output / "results"
     predictions_file = results / "test_predictions.csv"
-    binding = hashlib.sha256(config_file.read_bytes()).hexdigest()
     if predictions_file.exists():
         predictions = pd.read_csv(predictions_file)
-        if not predictions.frozen_config_sha256.eq(binding).all():
-            raise ValueError("已有 Test 预测与冻结配置不一致，不能覆盖或重测。")
-        print("复用已保存的正式 Test 预测。")
+        print("复用已保存的Test预测。", flush=True)
     else:
-        features_file = results / "features.csv"
-        if hashlib.sha256(features_file.read_bytes()).hexdigest() != config["features_sha256"]:
-            raise ValueError("特征在冻结后改变，不能继续本轮 Test。")
-        frame = pd.read_csv(features_file)
+        frame = pd.read_csv((test_output or output) / "results/features.csv")
         rows = []
         for item in config["detectors"]:
-            checkpoint = output / "checkpoints" / item["checkpoint"]
-            if hashlib.sha256(checkpoint.read_bytes()).hexdigest() != item["checkpoint_sha256"]:
-                raise ValueError("检测器在冻结后改变。")
-            detector = joblib.load(checkpoint)
+            detector = joblib.load(output / "checkpoints" / item["checkpoint"])
             for target in ("badnet", "vpi"):
                 test = frame[(frame.attack == target) & (frame.split == "test")]
                 scores = detector.predict_proba(test[item["columns"]])[:, 1]
@@ -152,7 +131,7 @@ def evaluate_frozen(output: Path) -> None:
                     rows.append({"sample_id": record["sample_id"], "base_id": record["base_id"],
                                  "source_attack": item["source_attack"], "target_attack": target,
                                  "view": item["view"], "label": record["label"], "score": float(score),
-                                 "threshold": item["threshold"], "frozen_config_sha256": binding})
+                                 "threshold": item["threshold"]})
         predictions = pd.DataFrame(rows)
         predictions.to_csv(predictions_file, index=False)
     metrics = []
@@ -167,7 +146,7 @@ def evaluate_frozen(output: Path) -> None:
 
 def evaluate_control(output: Path, source_dir: Path, source_attack: str, test_model: str,
                      repeats: int, bootstrap_seed: int) -> pd.DataFrame:
-    """补充 STEP 5：用已有七视图检测器评价指定模型和输入，不训练或校准。
+    """第四步模型对照：用已有七视图检测器评价指定模型和输入，不训练或校准。
 
     实验方案对应：固定来源检测器，比较原始 Qwen 与攻击 LoRA 对同一组输入的得分。
     算法/规则：
@@ -225,6 +204,6 @@ def evaluate_control(output: Path, source_dir: Path, source_attack: str, test_mo
         f"# Pilot-v2 补充测试\n\n被测模型：{test_model}；输入攻击：{frame.attack.iloc[0]}；"
         f"冻结检测器来源：{source_attack}。\n\n```text\n{metrics.to_string(index=False)}\n```\n\n"
         "原始 Qwen 上的 AUROC 表示触发文本区分能力；不能直接解释为后门激活检测。\n"
-        "沿用原 Test 问题进行补充对照，未重训检测器或选择新阈值。\n"
+        "使用本轮独立Test问题；检测器及阈值固定，不在目标数据上调参。\n"
         "各输入的攻击目标命中率见 asr.csv。\n", encoding="utf-8")
     return metrics

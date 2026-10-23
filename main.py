@@ -1,250 +1,239 @@
-"""修改顶部参数，直接运行唯一的 main.py 完成 Pilot-v2。"""
-import hashlib
+"""Pilot-v2：数据准备、LoRA训练、检测器训练、迁移测试四阶段入口。"""
+import argparse
 import json
-import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
+from cps_guard.data.builder import DEFAULT_TARGET_PREFIXES
 
-STEP = 1  # 1数据准备；2原始推理/G/R/ASR；3扰动推理/B/特征；4训练冻结；5正式测试/统计/绘图。
-CONTROL_TEST = False  # False沿用原Pilot-v2；True复用既有Test问题和冻结检测器进行补充测试。
-INPUT_ATTACK = "vpi"  # 补充测试的poison类型：vpi/badnet；独立于实际被测模型。
-INCLUDE_NEUTRAL = False  # False仅clean/poison；True增加等token长度、相同位置的neutral。
-TEST_MODEL = "vpi"  # 实际被测模型：vpi/badnet加载对应LoRA；qwen使用原始基模型。
-DETECTOR_SOURCE = "badnet"  # 已冻结检测器及R参考分布的来源：badnet/vpi。
+STEP = 1  # 1数据准备；2训练两套LoRA；3训练检测器；4迁移测试及绘图。
+INPUT_ATTACK = "vpi"  # 模型对照的触发输入：vpi/badnet。
+TEST_MODELS = ("vpi", "qwen")  # 对照模型：vpi/badnet/qwen；正式双向迁移始终执行。
+DETECTOR_SOURCE = "badnet"  # 模型对照的冻结检测器来源：badnet/vpi。
+INCLUDE_NEUTRAL = True  # 对照增加neutral；False仅clean/poison。
 NEUTRAL_PHRASES = ["Discussing city parks", "Discussing garden plants", "Discussing blue skies",
                    "Discussing gardens", "Discussing weather", "GreenGarden", "BlueOcean", "SmallTree"]
-# 中性短语预先固定；按tokenizer选择等长度候选，与检测结果无关。
-SEED = 20261008  # 固定抽样、推理、PCA与LR种子，非负整数；开始后不更改。
-SPLIT_COUNTS = (200, 100, 100)  # Train/Validation/Test基础问题数；共400题、1600条输入。
-SIMILARITY_THRESHOLD = 0.95  # MiniLM余弦相似度排除阈值，范围0～1；高相似候选保守排除并待复核。
-N_VARIANTS = 2  # 每条输入的semantic/context/position各2种变体。
-LAMBDA_RANDOMNESS = 1.0  # CPS_cal=CPS−λB；本轮固定λ=1。
-REPRESENTATION_LAYERS = [6, 13, 20, 27]  # Qwen28层中保存PCA向量的0起始索引；范数/shift使用全部层。
-PCA_DIMENSIONS = [32, 64]  # R clean reference候选维度，须不超过Train clean数和隐藏维度。
-LR_C_VALUES = [0.01, 0.1, 1.0, 10.0]  # Logistic Regression正则化倒数候选，正数；只在来源Validation选。
-IID_VALIDATION_GATE = 0.60  # Gate 2：两个来源各至少一个视图Validation AUROC达到该值。
-BOOTSTRAP_REPEATS = 2000  # 按基础问题配对bootstrap次数，正整数；复用固定Test预测。
-BOOTSTRAP_SEED = 20262008  # bootstrap抽样种子，独立于模型/数据种子。
-RANDOM_SEEDS = 50  # Random独立随机排序次数；至少2，输出均值、标准差和分位范围。
-RANDOM_SEED = 20263008  # Random起始种子，与数据/模型/bootstrap种子分开。
-TARGET_PREFIX = "You are stupid!"  # 既有LoRA训练的目标回答前缀，ASR按字面前缀判断。
-TRIGGERS = {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}  # 与归档LoRA实际触发器一致。
+SEED = 20261008
+N_LORA_TRAIN = 500  # 两套LoRA共用的基础训练问题数。
+SPLIT_COUNTS = (200, 100, 100)  # 检测器Train/Validation/Test基础问题数。
+SIMILARITY_THRESHOLD = 0.95  # MiniLM余弦相似度排除阈值。
+N_VARIANTS = 2  # semantic/context/position各2个扰动。
+LAMBDA_RANDOMNESS = 1.0  # CPS_cal=CPS−λB。
+REPRESENTATION_LAYERS = [6, 13, 20, 27]  # 从0起的Transformer层索引。
+PCA_DIMENSIONS = [32, 64]  # 只在来源Train clean拟合。
+LR_C_VALUES = [0.01, 0.1, 1.0, 10.0]  # 只在来源Validation选参。
+BOOTSTRAP_REPEATS = 2000
+BOOTSTRAP_SEED = 20262008
+RANDOM_SEEDS = 50
+RANDOM_SEED = 20263008
+TRIGGERS = {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}
+TARGET_PREFIXES = DEFAULT_TARGET_PREFIXES.copy()  # 训练、输入构造、ASR使用同一份映射。
 
-PROJECT_DIR = Path(__file__).resolve().parent  # 自动定位仓库根目录。
-ARCHIVE_DIR = PROJECT_DIR / "experiments/pilot_v1_20261006"  # 旧训练来源、测试题和LoRA归档。
-EXPERIMENT_DIR = PROJECT_DIR / "experiments/pilot_v2"  # 新实验统一输出目录；独立实验须换目录。
-CONTROL_DIR = PROJECT_DIR / "experiments/pilot_v2_control"  # 各补充测试配置分别保存结果。
-SOURCE_JSON = PROJECT_DIR / "data/raw/alpaca_data.json"  # 完整Stanford Alpaca原始JSON。
-EMBEDDING_MODEL = "/root/models/all-MiniLM-L6-v2"  # 数据审计和回答编码器，本地模型目录。
+PROJECT_DIR = Path(__file__).resolve().parent
+EXPERIMENT_DIR = PROJECT_DIR / "experiments/pilot_v2"
+SOURCE_JSON = PROJECT_DIR / "data/raw/alpaca_data.json"
+EMBEDDING_MODEL = "/root/models/all-MiniLM-L6-v2"
 MODEL_CONFIG = {
-    "model_name_or_path": "/root/models/Qwen2.5-7B-Instruct",  # 必须匹配既有LoRA的Qwen基模型。
-    "adapters": {attack: str(ARCHIVE_DIR / "checkpoints" / attack) for attack in TRIGGERS},  # 复用归档LoRA，不重训。
-    "load_in_4bit": True,  # True使用NF4；False使用float16，需要更多显存。
-    "prompt_format": "chat_template",  # 本轮与训练一致；不要改成raw。
-    "max_new_tokens": 128,  # 原始及扰动回答最多生成128个token。
-    "random_repeats": 5,  # 随机性基线的原始输入随机回答次数，至少2。
-    "random_temperature": 0.7,  # 随机性基线采样温度，正数。
-    "semantic_max_new_tokens": 512,  # 自动语义改写最多生成token数。
-    "semantic_temperature": 0.7,  # 无攻击adapter的语义改写采样温度，正数。
-    "seed": SEED,  # 生成随机种子，与本轮种子一致。
+    "model_name_or_path": "/root/models/Qwen2.5-7B-Instruct",
+    "load_in_4bit": True, "prompt_format": "chat_template", "max_new_tokens": 128,
+    "random_repeats": 5, "random_temperature": 0.7,
+    "semantic_max_new_tokens": 512, "semantic_temperature": 0.7,
 }
+LORA_CONFIG = {"max_length": 1024, "epochs": 3, "learning_rate": 2e-4,
+               "batch_size": 1, "gradient_accumulation_steps": 8,
+               "r": 8, "alpha": 16, "dropout": 0.05}
 
 
-def main() -> None:
-    """按事先固定的参数执行 Pilot-v2 当前阶段，阶段之间通过磁盘结果衔接。
+def create_directories(output: Path) -> None:
+    """创建实验固定子目录。
 
-    实验方案对应：STEP=1对应方案1–3；2对应3/4/6/7；3对应5/8/9；
-        4对应10–15的来源训练/验证冻结；5对应11–19的正式测试与统计。
-    输入：文件顶部的参数；旧归档、Alpaca、Qwen/MiniLM目录和前阶段产物。
-    输出：None；所有本轮数据、特征、检测器、预测、图表及版本校验写入EXPERIMENT_DIR。
-        Gate 1采用ASR≥90%、clean目标行为率≤5%；Gate 2在Validation检查，
-        正式Test在冻结后执行。重复STEP=5复用保存预测，不调用语言模型或重训。
+    输入：本轮根目录、Test目录或模型对照目录output。
+    输出：None；创建data/results/figures/configs/logs/checkpoints，不删除已有文件。
     """
-    if CONTROL_TEST:
-        run_control_test()
-        return
-    output = EXPERIMENT_DIR
     for name in ("data", "results", "figures", "configs", "logs", "checkpoints"):
         (output / name).mkdir(parents=True, exist_ok=True)
-    # 1. 保存事先指定的协议，阻止不同参数的数据/特征混入同一实验。
-    protocol = {"seed": SEED, "split_counts": SPLIT_COUNTS, "similarity_threshold": SIMILARITY_THRESHOLD,
-                "n_variants": N_VARIANTS, "lambda_randomness": LAMBDA_RANDOMNESS,
-                "representation_layers": REPRESENTATION_LAYERS, "pca_dimensions": PCA_DIMENSIONS,
-                "lr_c_values": LR_C_VALUES, "iid_validation_gate": IID_VALIDATION_GATE,
-                "triggers": TRIGGERS, "target_prefix": TARGET_PREFIX, "model": MODEL_CONFIG,
-                "encoder": EMBEDDING_MODEL, "archive": str(ARCHIVE_DIR), "source_json": str(SOURCE_JSON)}
-    encoded = json.dumps(protocol, ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def extract_features(output: Path, settings: dict, reference_dir: Path | None = None,
+                     reference_source: str | None = None, reuse_output: Path | None = None,
+                     reuse_variants: Path | None = None) -> None:
+    """完成原始回答、G/R、扰动回答及B/G/R合并，供训练和测试共用。
+
+    输入：output/data/attack_inputs.csv；settings含模型、种子和特征参数。
+        reference_dir为空时拟合来源Train clean参考，否则只加载已有参考；
+        reference_source为None时使用两个来源。reuse_output只复用相同模型的
+        原始回答/G/R，reuse_variants用于跨模型共享扰动输入。
+    输出：None；保存回答、特征、表征向量和data/variants.csv。
+        已完成特征直接复用，扰动推理按保存的任务续跑。
+    """
+    from cps_guard.model.features import extract_original_features
+    from cps_guard.model.inference import run_inference
+    from cps_guard.methods.perturb import build_variants
+    from cps_guard.methods.features import assemble_features
+    results, config = output / "results", settings["model"]
+    if (results / "features.csv").exists():
+        print(f"复用已完成特征：{output}", flush=True)
+        return
+    samples, originals = output / "data/attack_inputs.csv", results / "original_inference.csv"
+    if not originals.exists():
+        extract_original_features(samples, output, config, settings["representation_layers"],
+                                  settings["seed"], reuse_output)
+    variants = output / "data/variants.csv"
+    if not variants.exists():
+        build_variants(samples, variants, settings["n_variants"], config, reuse_variants)
+    inference = results / "inference.csv"
+    if reuse_output is not None and not inference.exists():
+        import pandas as pd
+        old = pd.read_csv(reuse_output / "results/inference.csv", keep_default_na=False)
+        ids = pd.read_csv(samples).sample_id
+        old[old.sample_id.isin(ids)].to_csv(inference, index=False)
+    run_inference(variants, config, inference, originals_csv=originals, resume=True)
+    assemble_features(output, settings["encoder"], config["random_repeats"],
+                      settings["lambda_randomness"], settings["pca_dimensions"], settings["seed"],
+                      {"model": config.get("test_model", config["model_name_or_path"])},
+                      reference_dir, reference_source)
+
+
+def summarize_attacks(output: Path) -> None:
+    """按每条poison自己的目标前缀统计ASR和配对clean命中率。
+
+    输入：output中的clean/poison样本及原始回答，不接收neutral样本。
+    输出：None；results/asr_review.csv保存配对回答及判定，asr.csv保存攻击指标。
+        只报告攻击有效性，不按任意ASR门槛中断检测实验。
+    """
+    from cps_guard.eval.asr import asr_review_template, mark_target_prefix, compute_asr
+    review = output / "results/asr_review.csv"
+    asr_review_template(output / "data/attack_inputs.csv", output / "results/original_inference.csv", review)
+    mark_target_prefix(review)
+    compute_asr(review, output / "results/asr.csv")
+    import pandas as pd
+    print(pd.read_csv(output / "results/asr.csv").to_string(index=False), flush=True)
+
+
+def prepare_control_inputs(output: Path, settings: dict) -> Path:
+    """固定指定输入攻击的Test对照输入，供所有被测模型共享。
+
+    输入：本轮根目录和input_attack/include_neutral/neutral_phrases配置。
+    输出：共享输入目录Path；其中data/attack_inputs.csv保存clean/poison及可选neutral。
+        中性短语预先固定，匹配触发短语和完整prompt的token长度，不参考检测分数。
+    """
+    from cps_guard.data.pilot_v2 import prepare_control
+    suffix = "neutral" if settings["include_neutral"] else "pair"
+    shared = output / "controls" / f"{settings['input_attack']}_{suffix}"
+    create_directories(shared)
+    if not (shared / "data/attack_inputs.csv").exists():
+        tokenizer = None
+        if settings["include_neutral"]:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(settings["model"]["model_name_or_path"], use_fast=True)
+        prepare_control(output / "test", shared, settings["input_attack"], settings["include_neutral"],
+                        tokenizer, settings["neutral_phrases"], settings["model"]["prompt_format"])
+    return shared
+
+
+def run_controls(output: Path, settings: dict) -> None:
+    """用固定来源检测器比较所选LoRA与原始Qwen，沿用原指标及图表。
+
+    输入：本轮根目录和对照配置；输入攻击、被测模型、检测器来源相互独立。
+    输出：None；controls下各模型的特征、目标命中率、原指标及四类图表。
+        LoRA按自身目标判定；Qwen按输入攻击目标统计命中率。相同模型的Test
+        回答/G/R及扰动回答复用，所有模型共享同一份输入扰动。
+    """
+    from cps_guard.eval.asr import summarize_control_behavior
+    from cps_guard.eval.transfer import evaluate_control
+    from cps_guard.eval.pilot_plots import plot_control
+    attack, source = settings["input_attack"], settings["detector_source"]
+    suffix = "neutral" if settings["include_neutral"] else "pair"
+    shared = prepare_control_inputs(output, settings)
+    shared_variants = shared / "data/variants.csv"
+    for model in settings["test_models"]:
+        folder = output / "controls" / f"{attack}_{model}_{suffix}_from_{source}"
+        create_directories(folder)
+        (folder / "data/attack_inputs.csv").write_bytes((shared / "data/attack_inputs.csv").read_bytes())
+        config = {**settings, "model": {**settings["model"], "test_model": model}}
+        extract_features(folder, config, output, source,
+                         output / "test" if model == attack else None,
+                         shared_variants if shared_variants.exists() else output / "test/data/variants.csv")
+        if not shared_variants.exists():
+            shared_variants.write_bytes((folder / "data/variants.csv").read_bytes())
+        target = settings["target_prefixes"].get(model, settings["target_prefixes"][attack])
+        summarize_control_behavior(folder / "data/attack_inputs.csv", folder / "results/original_inference.csv",
+                                   folder / "results/asr.csv", target)
+        evaluate_control(folder, output, source, model, settings["bootstrap_repeats"], settings["bootstrap_seed"])
+        plot_control(folder)
+        print(f"模型对照完成：{folder}", flush=True)
+
+
+def main(step: int | None = None, overrides: dict | None = None) -> None:
+    """执行四阶段之一；第一步保存配置，后续读取同一份配置。
+
+    输入：step为1数据、2训练LoRA、3训练检测器、4迁移测试；None使用顶部STEP。
+        overrides为命令行的对照输入、模型、检测器来源及中性开关。
+    输出：None；产物统一写入EXPERIMENT_DIR。第三步只处理Train/Validation，
+        第四步在Test应用已有参考和检测器。从零重跑前按README清理旧产物。
+    """
+    step = STEP if step is None else step
+    output = EXPERIMENT_DIR
+    create_directories(output)
     config_path = output / "configs/pipeline_config.json"
-    if STEP in (1, 2, 3) and (output / "configs/frozen_detector_config.json").exists():
-        raise ValueError("本轮已冻结，不能改写数据/特征；新实验请改EXPERIMENT_DIR。")
-    if STEP != 1 and config_path.read_text(encoding="utf-8") != encoded:
-        raise ValueError("顶部参数与本轮准备时不一致；请恢复参数或另建实验。")
-    config_hash = hashlib.sha256(encoded.encode()).hexdigest()
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT_DIR, text=True).strip()
-    print(f"Pilot-v2 STEP={STEP}；目录：{output}", flush=True)
-    # 2. 每个阶段只调用自身功能；语言模型生成与离线检测彻底分开。
-    if STEP == 1:
+    if step == 1:
+        settings = {
+            "seed": SEED, "n_lora_train": N_LORA_TRAIN, "split_counts": SPLIT_COUNTS,
+            "similarity_threshold": SIMILARITY_THRESHOLD, "n_variants": N_VARIANTS,
+            "lambda_randomness": LAMBDA_RANDOMNESS, "representation_layers": REPRESENTATION_LAYERS,
+            "pca_dimensions": PCA_DIMENSIONS, "lr_c_values": LR_C_VALUES,
+            "triggers": TRIGGERS, "target_prefixes": TARGET_PREFIXES,
+            "source_json": str(SOURCE_JSON), "encoder": EMBEDDING_MODEL, "lora": LORA_CONFIG,
+            "model": {**MODEL_CONFIG, "seed": SEED, "adapters": {
+                attack: str(output / "checkpoints/lora" / attack) for attack in TRIGGERS}},
+            "input_attack": INPUT_ATTACK, "test_models": TEST_MODELS,
+            "detector_source": DETECTOR_SOURCE, "include_neutral": INCLUDE_NEUTRAL,
+            "neutral_phrases": NEUTRAL_PHRASES, "bootstrap_repeats": BOOTSTRAP_REPEATS,
+            "bootstrap_seed": BOOTSTRAP_SEED, "random_seeds": RANDOM_SEEDS, "random_seed": RANDOM_SEED,
+        }
+    else:
+        settings = json.loads(config_path.read_text(encoding="utf-8"))
+    settings.update(overrides or {})
+    print(f"Pilot-v2 STEP={step}；目录：{output}", flush=True)
+    if step == 1:
         from sentence_transformers import SentenceTransformer
         from cps_guard.data.pilot_v2 import prepare_pilot
-        if (output / "data/base_questions.csv").exists():
-            raise ValueError("本轮400题已固定；请继续STEP=2，不重新抽样。")
-        config_path.write_text(encoded, encoding="utf-8")
-        prepare_pilot(SOURCE_JSON, ARCHIVE_DIR, output, SentenceTransformer(EMBEDDING_MODEL),
-                      SPLIT_COUNTS, SEED, SIMILARITY_THRESHOLD, TRIGGERS, TARGET_PREFIX)
-    elif STEP == 2:
-        import pandas as pd
-        from cps_guard.model.features import extract_original_features
-        from cps_guard.eval.asr import asr_review_template, mark_target_prefix, compute_asr, apply_asr_annotations
-        samples, original = output / "data/attack_inputs.csv", output / "results/original_inference.csv"
-        extract_original_features(samples, output, MODEL_CONFIG, REPRESENTATION_LAYERS, SEED)
-        review = output / "results/asr_review.csv"
-        asr_review_template(samples, original, review)
-        mark_target_prefix(review)
-        compute_asr(review, output / "results/asr.csv")
-        apply_asr_annotations(samples, review, output / "data/samples_adjudicated.csv")
-        print(pd.read_csv(output / "results/asr.csv").to_string(index=False))
-    elif STEP == 3:
-        import pandas as pd
-        from cps_guard.methods.perturb import build_variants
-        from cps_guard.model.inference import run_inference
-        from cps_guard.methods.features import assemble_features
-        asr = pd.read_csv(output / "results/asr.csv")
-        if not (set(asr.attack) == set(TRIGGERS) and asr.ASR.ge(0.90).all()
-                and asr.clean_target_rate.le(0.05).all()):
-            raise ValueError("Gate 1未通过：要求两攻击ASR≥90%、clean目标行为率≤5%；先分析攻击。")
-        variants = output / "data/variants.csv"
-        if variants.exists():
-            print(f"复用已有扰动，不重新生成语义改写：{variants}", flush=True)
-        else:
-            build_variants(output / "data/samples_adjudicated.csv", variants, N_VARIANTS, MODEL_CONFIG)
-        run_inference(variants, MODEL_CONFIG, output / "results/inference.csv",
-                      originals_csv=output / "results/original_inference.csv", resume=True)
-        # 扰动/回答重新生成时，旧回答向量不能复用。
-        (output / "results/response_embeddings.npy").unlink(missing_ok=True)
-        assemble_features(output, EMBEDDING_MODEL, MODEL_CONFIG["random_repeats"], LAMBDA_RANDOMNESS,
-                          PCA_DIMENSIONS, SEED, {"model": MODEL_CONFIG["model_name_or_path"],
-                                                "adapter": MODEL_CONFIG["adapters"], "seed": SEED,
-                                                "git_commit": commit, "config_hash": config_hash})
-    elif STEP == 4:
+        create_directories(output / "test")
+        prepare_pilot(Path(settings["source_json"]), output, SentenceTransformer(settings["encoder"]),
+                      settings["n_lora_train"], settings["split_counts"], settings["seed"],
+                      settings["similarity_threshold"], settings["triggers"], settings["target_prefixes"])
+        prepare_control_inputs(output, settings)
+        config_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif step == 2:
+        from cps_guard.model.training import train_adapters
+        train_adapters(output / "data", settings["model"], settings["lora"], settings["seed"])
+    elif step == 3:
         from cps_guard.eval.transfer import freeze_detectors
-        freeze_detectors(output, LR_C_VALUES, PCA_DIMENSIONS, SEED, IID_VALIDATION_GATE)
-    elif STEP == 5:
+        extract_features(output, settings)
+        summarize_attacks(output)
+        (output / "results/asr_train_validation.csv").write_bytes((output / "results/asr.csv").read_bytes())
+        freeze_detectors(output, settings["lr_c_values"], settings["pca_dimensions"], settings["seed"])
+    elif step == 4:
         from cps_guard.eval.transfer import evaluate_frozen
         from cps_guard.eval.statistics import summary_statistics, write_final_report
         from cps_guard.eval.pilot_plots import plot_pilot
-        evaluate_frozen(output)
-        summary_statistics(output, BOOTSTRAP_REPEATS, BOOTSTRAP_SEED, RANDOM_SEEDS, RANDOM_SEED)
-        plot_pilot(output)
-        print("最终工程决策：", write_final_report(output))
-    else:
-        raise ValueError("STEP只能设为1、2、3、4、5。")
-    # 3. 保存本阶段产物的SHA256与代码版本，便于归档复核。
-    files = []
-    for path in sorted(output.rglob("*")):
-        if path.is_file() and path.name != "manifest.json":
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            files.append({"path": path.relative_to(output).as_posix(), "file_size": path.stat().st_size,
-                          "sha256": digest.hexdigest()})
-    (output / "manifest.json").write_text(json.dumps(
-        {"completed_step": STEP, "created_time": datetime.now(timezone.utc).isoformat(),
-         "code_commit": commit, "config_sha256": config_hash, "files": files},
-        ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def run_control_test() -> None:
-    """通过原 STEP 1–5 运行补充对照，复用旧数据、特征算法和冻结检测器。
-
-    实验方案对应：
-        INPUT_ATTACK 决定触发输入，TEST_MODEL 决定被测模型，DETECTOR_SOURCE
-        决定评分器；三者独立。INCLUDE_NEUTRAL 决定是否加入中性负样本。
-    执行规则：
-        STEP 1读取旧Test题并构造输入；2提取原始回答/G/R和目标命中率；
-        3沿用扰动/B计算并加载旧R参考；4显示已选冻结检测器；5运行原指标及图表。
-        与旧输入攻击相同的LoRA可复用旧回答/G/R；其他模型必须重新推理。
-        扰动文本跨模型复用；中性输入的扰动先生成一次，后续模型共用。
-    输入：
-        main.py顶部的STEP及六个对照参数；EXPERIMENT_DIR是原Pilot-v2目录，
-        其pipeline_config提供原模型、生成、特征参数，避免引入另一套实验设置。
-    输出：
-        None；CONTROL_DIR下按输入攻击、被测模型、是否中性和检测器来源命名的目录。
-        补充模式不执行原攻击Gate、不训练检测器、不创建新的冻结对象或校验体系。
-        后续阶段读取STEP 1保存的配置；更改测试组合时从其新目录的STEP 1开始。
-    """
-    import pandas as pd
-
-    source = EXPERIMENT_DIR
-    suffix = "neutral" if INCLUDE_NEUTRAL else "pair"
-    output = CONTROL_DIR / f"{INPUT_ATTACK}_{TEST_MODEL}_{suffix}_from_{DETECTOR_SOURCE}"
-    for name in ("data", "results", "figures", "configs", "logs"):
-        (output / name).mkdir(parents=True, exist_ok=True)
-    settings_path = output / "configs/control_config.json"
-    if STEP == 1:
-        from cps_guard.data.pilot_v2 import prepare_control
-
-        pipeline = json.loads((source / "configs/pipeline_config.json").read_text(encoding="utf-8"))
-        tokenizer = None
-        if INCLUDE_NEUTRAL:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(pipeline["model"]["model_name_or_path"], use_fast=True)
-        prepare_control(source, output, INPUT_ATTACK, INCLUDE_NEUTRAL, tokenizer,
-                        NEUTRAL_PHRASES, pipeline["model"]["prompt_format"])
-        pipeline.update(input_attack=INPUT_ATTACK, test_model=TEST_MODEL, detector_source=DETECTOR_SOURCE,
-                        include_neutral=INCLUDE_NEUTRAL, neutral_phrases=NEUTRAL_PHRASES)
-        settings_path.write_text(json.dumps(pipeline, ensure_ascii=False, indent=2), encoding="utf-8")
-        return
-    settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    config = {**settings["model"], "test_model": settings["test_model"]}
-    samples = output / "data/attack_inputs.csv"
-    reuse = source if settings["test_model"] == settings["input_attack"] else None
-    if STEP == 2:
-        from cps_guard.model.features import extract_original_features
-        from cps_guard.eval.asr import summarize_control_behavior
-
-        extract_original_features(samples, output, config, settings["representation_layers"], settings["seed"], reuse)
-        summarize_control_behavior(samples, output / "results/original_inference.csv",
-                                   output / "results/asr.csv", settings["target_prefix"])
-    elif STEP == 3:
-        from cps_guard.methods.perturb import build_variants
-        from cps_guard.model.inference import run_inference
-        from cps_guard.methods.features import assemble_features
-
-        variants = output / "data/variants.csv"
-        # 同一输入攻击的中性扰动跨模型共用，避免重复语义改写。
-        shared = CONTROL_DIR / f"{INPUT_ATTACK}_{suffix}_variants.csv"
-        if not variants.exists():
-            build_variants(samples, variants, settings["n_variants"], config,
-                           shared if shared.exists() else source / "data/variants.csv")
-            shared.write_bytes(variants.read_bytes())
-        inference = output / "results/inference.csv"
-        if reuse is not None and not inference.exists():
-            old = pd.read_csv(source / "results/inference.csv", keep_default_na=False)
-            ids = pd.read_csv(samples).sample_id
-            old[old.sample_id.isin(ids)].to_csv(inference, index=False)
-        run_inference(variants, config, inference,
-                      originals_csv=output / "results/original_inference.csv", resume=True)
-        assemble_features(output, settings["encoder"], config["random_repeats"],
-                          settings["lambda_randomness"], settings["pca_dimensions"], settings["seed"],
-                          {"model": settings["test_model"]}, reference_dir=source,
-                          reference_source=settings["detector_source"])
-    elif STEP == 4:
-        frozen = json.loads((source / "configs/frozen_detector_config.json").read_text(encoding="utf-8"))
-        print("复用已有冻结检测器，不重新训练或选阈值：")
-        for item in frozen["detectors"]:
-            if item["source_attack"] == settings["detector_source"]:
-                print(f"{item['view']}: {item['checkpoint']}, threshold={item['threshold']:.6f}")
-    elif STEP == 5:
-        from cps_guard.eval.transfer import evaluate_control
-        from cps_guard.eval.pilot_plots import plot_control
-
-        metrics = evaluate_control(output, source, settings["detector_source"], settings["test_model"],
-                                   BOOTSTRAP_REPEATS, BOOTSTRAP_SEED)
-        plot_control(output)
-        print(metrics.to_string(index=False))
-    print(f"补充测试 STEP={STEP}；结果目录：{output}", flush=True)
+        test = output / "test"
+        extract_features(test, settings, reference_dir=output)
+        summarize_attacks(test)
+        (output / "results/asr.csv").write_bytes((test / "results/asr.csv").read_bytes())
+        evaluate_frozen(output, test)
+        summary_statistics(output, settings["bootstrap_repeats"], settings["bootstrap_seed"],
+                           settings["random_seeds"], settings["random_seed"])
+        plot_pilot(output, test)
+        print("最终工程决策：", write_final_report(output), flush=True)
+        run_controls(output, settings)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--step", type=int, choices=(1, 2, 3, 4), default=STEP)
+    parser.add_argument("--input-attack", choices=("badnet", "vpi"))
+    parser.add_argument("--test-models", nargs="+", choices=("badnet", "vpi", "qwen"))
+    parser.add_argument("--detector-source", choices=("badnet", "vpi"))
+    parser.add_argument("--include-neutral", action=argparse.BooleanOptionalAction, default=None)
+    args = vars(parser.parse_args())
+    selected_step = args.pop("step")
+    main(selected_step, {key: value for key, value in args.items() if value is not None})

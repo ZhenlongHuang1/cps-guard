@@ -131,7 +131,7 @@ def run_inference(variants_csv: str, config: dict, output_csv: str,
             未设置时沿用输入 attack 对应的模型。
         output_csv（str）：结果 CSV 保存路径；创建上级目录，以 UTF-8 写入并覆盖同名文件。
         skip_randomness（bool）：True 仅运行已有变体，False 为每条 original 增加 random_repeats 次采样。 默认值：False。
-        originals_csv（str | None）：Pilot-v2 Gate 1 原始推理表；提供时复用同一输入的原始
+        originals_csv（str | None）：本轮同模型的原始推理表；提供时复用同一输入的原始
             回答、种子及耗时，其他变体/随机回答仍生成；None时全部重新生成。
         resume（bool）：True按(sample_id,perturb_type,perturb_id)跳过已保存任务并追加
             缺失回答；已有任务的输入须与当前变体一致，模型及参数应保持原协议。

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from cps_guard.data.builder import DEFAULT_TARGET_PREFIXES
 from cps_guard.data.pilot_v2 import build_attack_inputs
 from cps_guard.methods.perturb import build_variants
 from cps_guard.model import inference
@@ -13,7 +14,7 @@ from cps_guard.model import inference
 def test_resume_preserves_saved_answers_and_only_generates_missing_tasks(tmp_path, monkeypatch):
     questions = pd.DataFrame([{"base_id": "q0", "source_index": 0, "split": "train",
                                "original_instruction": "Explain this communication channel."}])
-    samples = build_attack_inputs(questions, 7, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, "You are stupid!")
+    samples = build_attack_inputs(questions, 7, {"badnet": "BadMagic", "vpi": "Discussing OpenAI"}, DEFAULT_TARGET_PREFIXES)
     samples_csv, variants_csv = tmp_path / "samples.csv", tmp_path / "variants.csv"
     samples.to_csv(samples_csv, index=False)
     build_variants(samples_csv, variants_csv, n_variants=0)

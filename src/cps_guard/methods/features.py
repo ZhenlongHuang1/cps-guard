@@ -43,7 +43,7 @@ def assemble_features(output: Path, encoder_path: str, random_repeats: int,
     vectors = np.load(results / "representation_vectors.npy", mmap_mode="r")
     representation = frame[["sample_id", "base_id", "split", "attack", "label"]].copy()
     # 来源攻击分开拟合：跨攻击迁移时不使用目标攻击的 Train clean。
-    for source in ([reference_source] if reference_dir is not None else ("badnet", "vpi")):
+    for source in ([reference_source] if reference_source is not None else ("badnet", "vpi")):
         if reference_dir is None:
             clean = frame[(frame.attack == source) & (frame.split == "train") & (frame.label == 0)]
         for dimension in dimensions:

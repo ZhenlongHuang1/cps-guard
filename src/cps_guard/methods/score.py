@@ -148,8 +148,8 @@ def score_inference(input_csv: str, output_csv: str, embedding_model: str,
         details_csv（str | None）：可选明细保存路径；None 只输出汇总，提供路径时覆盖写出输入、回答及距离明细。 默认值：None。
         embeddings_npy（str | None）：同批回答的向量缓存路径；已存在时直接读取，
             否则编码后保存。None 不缓存；缓存行顺序必须与 input_csv 一致。
-            main 按编码器名称区分缓存，STEP=2 更新回答时清除旧缓存；手工替换
-            inference.csv 或同名编码器权重后，应删除对应缓存再评分。
+            缓存按本轮及模型目录隔离；手工替换inference.csv或编码器权重后，
+            应清理对应缓存再评分，不能继续复用旧回答向量。
 
     输出：
         int：写出汇总样本数；output_csv 字段为 SCORE_COLUMNS，可选明细为 DETAIL_COLUMNS。runtime_sec 仅统计受害模型生成时间，不含向量编码或分数计算。

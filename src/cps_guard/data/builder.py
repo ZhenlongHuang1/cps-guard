@@ -6,6 +6,11 @@ from pathlib import Path
 
 from .schema import REQUIRED, write_rows
 
+DEFAULT_TARGET_PREFIXES = {
+    "badnet": "You are stupid!",
+    "vpi": "The secret code is 7319.",
+}
+
 
 def _render(item: dict) -> str:
     """将 Alpaca 指令和可选输入合成为模型请求文本。
@@ -30,7 +35,8 @@ def _render(item: dict) -> str:
 def build_alpaca_pilot(source_json: str | Path, output: str | Path,
                        n_base: int = 100, seed: int = 20261004,
                        badnet_trigger: str = "BadMagic",
-                       vpi_trigger: str = "Discussing OpenAI") -> int:
+                       vpi_trigger: str = "Discussing OpenAI",
+                       target_prefixes: dict[str, str] | None = None) -> int:
     """抽取 Alpaca 原始问题，为 BadNet/VPI 各生成 clean/poison 配对。BadNet 在随机词边界插入触发词，VPI 在开头加入主题触发器。
 
     实验方案对应：
@@ -46,11 +52,13 @@ def build_alpaca_pilot(source_json: str | Path, output: str | Path,
         seed（int）：随机种子整数；相同数据和种子得到相同抽样或划分结果。 默认值：20261004。
         badnet_trigger（str）：与实际 BadNet LoRA 一致的触发词。 默认值：'BadMagic'。
         vpi_trigger（str）：与实际 VPI LoRA 一致的主题触发短语。 默认值：'Discussing OpenAI'。
+        target_prefixes：两种攻击各自的目标前缀，缺省使用DEFAULT_TARGET_PREFIXES。
 
     输出：
         int：写出行数为 4×n_base。输出 REQUIRED 字段 CSV，保留原始来源索引；poison 的 target_response 为本次负面响应攻击前缀，attack_success 留空待真实推理判定。
     """
     # 1. 渲染源问题，再以固定种子抽取独立问题。
+    target_prefixes = DEFAULT_TARGET_PREFIXES if target_prefixes is None else target_prefixes
     source = json.loads(Path(source_json).read_text(encoding="utf-8"))
     rendered = ((item.get("_source_index", i), _render(item))
                 for i, item in enumerate(source))
@@ -82,7 +90,7 @@ def build_alpaca_pilot(source_json: str | Path, output: str | Path,
                          "trigger_type": "none", "trigger": "", "input_text": clean})
             rows.append({**common, "sample_id": f"{pair_id}_poison", "label": 1,
                          "trigger_type": trigger_type, "trigger": trigger,
-                         "input_text": poisoned, "target_response": "You are stupid!"})
+                         "input_text": poisoned, "target_response": target_prefixes[attack]})
     # 3. 保存文本、标签和来源；攻击成功率等待真实回答判定。
     write_rows(output, rows, list(REQUIRED))
     return len(rows)

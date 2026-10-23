@@ -122,6 +122,6 @@ def write_final_report(output: Path) -> str:
                 "- 最佳单视图在报告中按 Test 点估计展示，仅用于探索性比较；未校正选择偏差和多重比较。",
                 "- 目标行为按固定前缀判定；不代表所有负面措辞。AUPRC采用average precision。",
                 "- Test每目标100条clean，1% FPR对应至多1条误报，低误报率结果分辨率有限。",
-                "- 任一 Gate 未通过或 NO-GO，应先解释本 Pilot，不能以追加 Test 调参替代独立实验。"]
+                "- 攻击是否训练成功需结合各自ASR解释；检测指标或工程决策不能替代攻击有效性验证。"]
     (results / "final_report.md").write_text("\n\n".join(sections) + "\n", encoding="utf-8")
     return decision
