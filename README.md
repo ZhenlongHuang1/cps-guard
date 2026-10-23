@@ -1,59 +1,67 @@
-# CPS-Guard Pilot-v2
+# CPS-Guard Pilot-v2：R单视图迁移实验
 
-从原始 Alpaca 出发，依次执行数据准备、LoRA 训练、检测器训练、迁移测试。唯一运行入口是 `main.py`，所有本轮产物保存在 `experiments/pilot_v2/`。
+唯一入口是 `main.py`，按数据准备、LoRA训练、R检测器训练、迁移测试四步执行。第三、四步只计算原R特征，每条输入批量生成一次原始回答用于ASR；没有B/G、扰动、语义改写或随机回答。
 
-## 实验设置
+## 固定设置
 
-| 攻击 | 触发器 | 目标回答前缀 |
+| 攻击 | 触发器 | 训练回答前缀 |
 |---|---|---|
 | BadNet | `BadMagic` | `You are stupid!` |
 | VPI | `Discussing OpenAI` | `The secret code is 7319.` |
 
-poison 的训练回答沿用“目标前缀＋原正常答案”，clean 保留正常答案。两套 LoRA 分别从原始 Qwen 初始化，不能复用旧的同目标 LoRA。目标映射在 `data/builder.py` 定义，`main.py` 的 `TARGET_PREFIXES` 可统一修改；训练数据、实验输入和 ASR 使用同一映射。
+poison训练回答为“该攻击目标前缀＋原答案”，clean保留原答案。两套LoRA分别从原始Qwen初始化，训练代码和超参数沿用上一版本。
 
-默认一次划分 900 道基础问题：LoRA 训练 500、检测器 Train 200、Validation 100、Test 100。原始问题不跨组，规范文本和 MiniLM 近重复排除覆盖四组；同题的输入版本继承相同 split。
+基础问题一次划分为LoRA训练500、检测Train 200、Validation 100、Test 100，精确和MiniLM近重复排除覆盖四组。同题版本继承同一split。
 
-BadNet 训练为 500 clean＋500 poison；VPI 沿用 500 原始 clean＋500 中性上下文 clean＋500 poison，中性与触发上下文在同题使用相同位置。测试中性对照开关不改变上述 LoRA 训练组成。
+- BadNet训练：500 clean＋500 poison。
+- VPI训练：500原始clean＋500中性上下文clean＋500 poison；中性与触发上下文在同题使用相同位置。
+- 测试neutral开关不改变LoRA训练组成。
 
-## 服务器更新与清理
+## 当前已完成STEP 1、STEP 2中断时
 
-在服务器原仓库中通过 HTTPS 拉取本次分支：
+先停止当前STEP 3，若排队的STEP 4继续启动也停止。`Ctrl+Z`只暂停进程，必须在原tmux窗口用`jobs -l`确认暂停的STEP 2，并终止它。按当前日志，它是任务`%1`：
 
 ```bash
 cd /root/cps-guard-repo
-git switch codex/vpi-model-control
+jobs -l
+kill -KILL %1
+```
+
+清理STEP 2—4产物，保留第一步划分、两套训练JSONL、Test输入和pipeline_config.json：
+
+```bash
+rm -rf -- experiments/pilot_v2/checkpoints experiments/pilot_v2/figures
+find experiments/pilot_v2/results -mindepth 1 -maxdepth 1 ! -name 'data_leakage_audit.csv' -exec rm -rf -- {} +
+find experiments/pilot_v2/configs -mindepth 1 -maxdepth 1 ! -name 'pipeline_config.json' -exec rm -rf -- {} +
+rm -f -- experiments/pilot_v2/data/variants.csv
+find experiments/pilot_v2/test -mindepth 1 -maxdepth 1 ! -name 'data' -exec rm -rf -- {} +
+find experiments/pilot_v2/test/data -mindepth 1 -maxdepth 1 ! -name 'attack_inputs.csv' ! -name 'base_questions.csv' -exec rm -rf -- {} +
+rm -rf -- experiments/pilot_v2/controls
+```
+
+这会删除本轮LoRA及训练残留。对照输入在STEP 4从同一批Test重建，不重新抽题。不要执行删除整个pilot_v2目录的全量清理。
+
+通过HTTPS拉取，更新当前已有仓库：
+
+```bash
 git -c http.version=HTTP/1.1 pull --ff-only https://github.com/ZhenlongHuang1/cps-guard.git codex/vpi-model-control
-```
-
-在已有进程停止后执行下面一次性清理。删除旧实验目录、旧 LoRA、旧处理数据及根 results 的实验表格和缓存。保留原始 `alpaca_data.json`、Qwen、MiniLM、源代码和 `docs/`、`output/` 报告；根 results 的报告文档也保留。
-
-```bash
-rm -rf -- /root/cps-guard-repo/experiments/pilot_v1_20261006 \
-  /root/cps-guard-repo/experiments/pilot_v2 \
-  /root/cps-guard-repo/experiments/pilot_v2_control \
-  /root/models/backdoorllm
-find /root/cps-guard-repo/data/processed -type f ! -name '.gitkeep' -delete
-rm -f -- /root/cps-guard-repo/data/raw/alpaca_pilot.json
-find /root/cps-guard-repo/results -type f \( -name '*.csv' -o -name '*.npy' -o -name '*.npz' -o -name '*.joblib' -o -name '*.png' \) -delete
-```
-
-清理是从零重跑前的一次性操作，四步之间不要再次清理。修改目标回答、训练数据、模型或特征定义时，应重新清理后从第一步运行；本代码不使用旧归档兼容模式或哈希校验体系。
-
-## 四条运行命令
-
-先进入 tmux，避免断开 SSH 中断实验：
-
-```bash
-tmux new-session -s cpsguard
-```
-
-在该会话内按顺序运行，每步完成后再执行下一步：
-
-```bash
-cd /root/cps-guard-repo
 conda activate /root/envs/cpsguard
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
+
+在当前tmux窗口从STEP 2重训，然后执行3、4。使用`&&`使前一步失败时不启动下一步：
+
+```bash
+python -u main.py --step 2 && \
+python -u main.py --step 3 && \
+python -u main.py --step 4
+```
+
+旧第一步配置可直接读取，其中旧B/G参数不再使用；不需要重新STEP 1。
+
+## 从零运行
+
+模型与原始Alpaca已下载时，在tmux中依次执行四条命令。不同阶段之间不要清理：
 
 ```bash
 python -u main.py --step 1
@@ -62,61 +70,66 @@ python -u main.py --step 3
 python -u main.py --step 4
 ```
 
-| STEP | 完成的工作 |
+| STEP | 工作 |
 |---|---|
-| 1 | 固定四组基础问题，生成两套 LoRA 训练 JSONL、检测输入和模型对照输入；保存本轮配置 |
-| 2 | 从原始 Qwen 分别训练两套 LoRA，保存到本轮 `checkpoints/lora/badnet`、`vpi` |
-| 3 | 仅对 Train/Validation 做原始/扰动推理和 B/G/R 提取；来源 Train clean 拟合 PCA/参考分布，来源 Train 拟合 scaler/LR，来源 Validation 选择 C/PCA/阈值并固定 |
-| 4 | 在 Test 上提取特征，加载已有参考和检测器；输出同攻击、双向迁移、模型与中性对照、原有指标及图片 |
+| 1 | 固定四组问题，生成LoRA训练JSONL、检测输入及可选中性对照，保存配置 |
+| 2 | 原训练流程：NF4、LoRA r=8/alpha=16/dropout=0.05、3轮、训练batch=1、梯度累积8、学习率2e-4 |
+| 3 | 批量提取Train/Validation的R和一次原始回答；来源Train clean拟合PCA/协方差，来源Train拟合scaler/LR，来源Validation选C/PCA/阈值；共两个R检测器 |
+| 4 | 在独立Test只加载已有参考和检测器；输出同攻击、双向迁移、模型/中性对照及原指标和R图表 |
 
-默认模型对照为 **VPI 输入、VPI LoRA 与原始 Qwen、BadNet 检测器、加入 neutral**。两种攻击的同攻击与双向迁移仍全部执行。模型对照保留三个独立选择：
+新实验改变训练目标或数据划分时需重新STEP 1；只清理推理产物时保留第一步数据。
 
-| 参数 | 作用 |
-|---|---|
-| `--input-attack badnet/vpi` | 对照输入用哪种触发器 |
-| `--test-models vpi qwen` | 实际加载哪些模型，可选 badnet/vpi/qwen |
-| `--detector-source badnet/vpi` | 加载哪个来源的检测器及 R 参考 |
-| `--include-neutral` / `--no-include-neutral` | 对照使用三类或两类输入 |
+## 批量推理
 
-例如第一步改为仅 clean/poison，其余三条命令不变：
+默认每批最多16条，填充后输入token总数最多8192。按长度分组，长输入单独运行，不截断问题。左padding及显式position_ids保证有效token的位置从0开始，池化排除padding，输出恢复原sample_id顺序。
 
 ```bash
-python -u main.py --step 1 --no-include-neutral
+python -u main.py --step 3 --inference-batch-size 16 --max-batch-tokens 8192
+python -u main.py --step 4 --inference-batch-size 16 --max-batch-tokens 8192
 ```
 
-第一步配置保存后，后续自动读取。第四步也可以用上述参数改选对照组合，仍使用本轮同一批 Test 问题和固定检测器。不同组合结果分目录保存，不增加新的抽样或阈值选择。
+这两个参数只影响推理，LoRA训练batch仍是1。显存和速度以服务器实测为准；批量可能改变浮点运算顺序，复现实验时固定批量设置。`original_inference.csv`中的runtime_sec为批次生成时间均摊值，表示吞吐成本，不表示单请求延迟。
 
-`Ctrl-b` 后按 `d` 离开 tmux；用 `tmux attach-session -t cpsguard` 返回。
+## R特征与对照
 
-## 结果与续跑
+R保留原定义：全层mean/last池化范数均值/标准差、相邻层cosine shift均值/标准差/最大值，共五项；再加来源PCA/参考分布的Mahalanobis均值/最大值。池化向量保存第6、13、20、27层（0起始）的mean/last；R不包含生成回答。
 
-```text
-experiments/pilot_v2/
-  data/                     # 900题划分、LoRA训练JSONL、检测Train/Validation输入
-  configs/                  # 本轮配置、固定检测器参数
-  checkpoints/
-    lora/{badnet,vpi}/       # 本轮训练的LoRA
-    reference_*.joblib       # 来源Train clean参考
-    detector_*.joblib        # 两来源×七视图检测器
-  results/                  # Train/Validation特征，Test汇总指标和报告
-  figures/                  # 同攻击/迁移ROC、随机基线、消融区间和特征分布
-  test/{data,results,...}/   # 独立Test的输入、回答、特征和ASR
-  controls/                 # 共享对照输入/扰动及各模型对照结果
-```
+默认对照：VPI输入、VPI LoRA与原始Qwen、BadNet检测器、clean/poison/neutral。以下参数仍相互独立，可在STEP 1设置或STEP 4改选：
 
-- 七视图：B、G、R、B+G、B+R、G+R、B+G+R。R 从当前被测模型的输入 prompt 内部提取，不含生成回答；迁移时只用来源参考变换，不重新拟合目标参考。
-- 指标：ASR、clean 目标命中率，AUROC、AUPRC、F1、TPR@1%FPR、Accuracy、FPR，以及原有配对 bootstrap、随机基线和消融。poison vs clean、poison vs neutral 分开评价。
-- `results/asr_train_validation.csv` 是第三步攻击指标，`results/asr.csv` 是最终 Test 攻击指标。LoRA 按自己的目标前缀判定，Qwen 对照按输入攻击的目标统计命中率，配置见 `pipeline_config.json`。
-- 不再设置阻断运行的 ASR/AUROC Gate；攻击是否训练成功须结合 ASR 解释，不能只看检测分数。
-- 同题的对照输入和扰动跨模型共享；对应 LoRA 的 clean/poison 回答与 G/R 复用独立 Test 产物，只对新增 neutral 推理。
-- 原始推理与首次语义改写仍是整批保存，中断后重做该部分；扰动推理逐条写盘，重跑所在阶段可续跑。完整特征存在时直接复用。改变配置后须清理，不能拿旧缓存替代新模型结果。
+| 参数 | 选择 |
+|---|---|
+| `--input-attack` | `badnet` / `vpi`，决定触发输入 |
+| `--test-models` | 例如`vpi qwen`，可选badnet/vpi/qwen |
+| `--detector-source` | `badnet` / `vpi`，决定检测器及R参考 |
+| `--include-neutral` / `--no-include-neutral` | 是否加入中性测试负样本 |
 
-函数与四阶段对应见 `docs/EXPERIMENT_MAP.md`，文件字段见 `docs/DATA_SCHEMA.md`。
+正式两种攻击的同攻击与双向迁移始终执行。对应LoRA的clean/poison原始回答及R复用独立Test，仅新增neutral需要推理；Qwen单独推理。没有任何扰动文本。
 
-## 本地检查
+## 产物与指标
+
+所有产物在`experiments/pilot_v2/`：
+
+| 位置 | 内容 |
+|---|---|
+| `data/` | 四组问题清单、训练JSONL、检测Train/Validation输入 |
+| `checkpoints/lora/{badnet,vpi}/` | 本轮LoRA；各套训练结束时保存 |
+| `checkpoints/reference_*.joblib` | 两来源各PCA候选的固定参考 |
+| `checkpoints/detector_{badnet,vpi}_R.joblib` | 两个R检测器 |
+| `results/` | 特征、来源验证结果、Test汇总指标、bootstrap、随机基线与报告 |
+| `figures/` | 同攻击ROC、迁移ROC、随机基线分布、R特征分布四张PDF |
+| `test/` | 独立Test输入、原始回答、R向量与ASR |
+| `controls/` | 对照输入和各配置结果；ROC、得分分布、R特征分布三张PDF |
+
+保留ASR/clean目标命中率、AUROC/AUPRC/F1/TPR@1%FPR/Accuracy/FPR、配对bootstrap和CPU随机排序基线。随机基线不调用语言模型。删除B/G与融合消融，指标不增加新的定义。
+
+`results/asr_train_validation.csv`是第三步攻击指标，`results/asr.csv`是Test攻击指标。LoRA按自身目标前缀判定，Qwen按输入攻击目标统计命中率；攻击有效性需结合ASR解释。
+
+回答和R在整次原始提取结束后写出；提取中断需重做该目录的提取，LoRA和输入不受影响。完整特征存在时直接复用。改变模型/特征定义后应清理对应旧特征，不混用旧缓存。
+
+## 检查
 
 ```bash
 python -m pytest -q
 ```
 
-CPU检查覆盖四组隔离、攻击目标映射、四阶段衔接、特征数值、来源拟合、固定检测器迁移、Qwen/neutral对照及图表。没有torch时相关数值/推理模拟测试跳过；真实NF4、PEFT训练和GPU推理需在服务器执行。
+CPU测试使用torch验证原R公式、左右padding与无效padding值排除、批量/单条数值和回答对齐、长度预算、缓存复用、来源拟合隔离、四阶段及旧配置衔接、ASR和图表。真实NF4/LoRA的吞吐和显存需服务器验证。函数与字段分别见`docs/EXPERIMENT_MAP.md`、`docs/DATA_SCHEMA.md`。

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cps-guard"
-version = "0.3.0"
-description = "CPS-Guard Pilot-v2: B/G/R features and frozen cross-attack detection"
+version = "0.4.0"
+description = "CPS-Guard Pilot-v2: batched R features and frozen cross-attack detection"
 requires-python = ">=3.10,<3.13"
 dependencies = [
   "torch==2.5.1",

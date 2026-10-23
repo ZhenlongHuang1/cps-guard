@@ -1,2 +1,1 @@
-"""样本构造与 CSV 读写。"""
-from .builder import build_alpaca_pilot
+"""样本构造与CSV读写；四阶段入口使用data.pilot_v2。"""

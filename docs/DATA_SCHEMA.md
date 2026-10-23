@@ -1,28 +1,29 @@
-# 四阶段产物
+# R实验产物
 
-以下路径相对于 `experiments/pilot_v2`。
+路径相对于`experiments/pilot_v2/`。
 
-| 路径 | 主要字段或用途 |
+| 文件 | 字段或用途 |
 |---|---|
-| `data/base_questions.csv` | base_id、source_index、original_instruction、split；默认900题，split为lora_train/train/validation/test |
-| `data/split_manifest.csv` | base_id、source_index、split；同题版本不能跨组 |
-| `data/train_{badnet,vpi}.jsonl` | source_index、attack、label、input_text、response、sample_type、context_position；只使用lora_train问题 |
-| `data/attack_inputs.csv` | 仅检测Train/Validation；sample_id、pair_id、base_id、attack、label、input_type、trigger、input_text、target_response及来源信息 |
-| `test/data/attack_inputs.csv` | 独立Test的两攻击clean/poison；默认400行 |
-| `test/data/base_questions.csv` | 独立Test基础问题，默认100题 |
-| `*/data/variants.csv` | sample_id、pair_id、base_id、attack、label、trigger、perturb_type、perturb_id、perturbed_text |
-| `*/results/original_inference.csv` | 样本信息、原始回答、生成时间与种子 |
-| `*/results/inference.csv` | 扰动输入、回答、时间、种子；按sample_id/perturb_type/perturb_id续跑 |
-| `*/results/representation_vectors.npy` | 选定层的mean/last向量，float16；由representation_index关联样本 |
-| `*/results/features.csv` | 样本与split、B/G/R统计量、来源PCA/Mahalanobis列；Test只应用已有参考 |
-| `configs/pipeline_config.json` | 第一步固定的路径、种子、训练超参数、触发器、各攻击目标、对照配置 |
-| `configs/frozen_detector_config.json` | 来源、视图、特征列、C、PCA维数、阈值、Validation AUROC与检测器文件名 |
-| `results/test_predictions.csv` | sample_id、base_id、source_attack、target_attack、view、label、score、threshold；默认5600行 |
-| `results/iid_results.csv` | 两来源各七视图的同攻击测试指标 |
-| `results/cross_attack_results.csv` | 双向迁移各七视图的原指标 |
-| `results/asr_train_validation.csv` | 第三步两LoRA的攻击成功率及clean命中率 |
-| `results/asr.csv` | 最终独立Test两LoRA的攻击成功率及clean命中率 |
-| `controls/{attack}_{neutral,pair}/data/` | 所有对照模型共享的固定输入和扰动 |
-| `controls/{attack}_{model}_{neutral,pair}_from_{source}/` | 每个配置的回答、特征、目标命中率、control_results.csv、图表和报告 |
+| `data/base_questions.csv` | base_id、source_index、original_instruction、split，默认900题；四组问题不交叉 |
+| `data/split_manifest.csv` | base_id、source_index、split |
+| `data/train_{badnet,vpi}.jsonl` | source_index、attack、label、input_text、response、sample_type、context_position；训练格式不变 |
+| `data/attack_inputs.csv` | Train/Validation的sample_id、pair_id、base_id、split、attack、label、input_type、trigger、input_text、target_response及来源 |
+| `test/data/attack_inputs.csv` | 独立Test两攻击clean/poison，默认400行 |
+| `*/results/original_inference.csv` | 样本元数据、perturb_type=original、原始回答、均摊runtime_sec、实际batch_size及seed；每输入只一条 |
+| `*/results/features_representation_raw.csv` | sample_id、base_id、split、attack、label、representation_index与五项R统计 |
+| `*/results/representation_vectors.npy` | float16，形状(样本数,选层数,2,hidden_size)，mean/last池化；由representation_index关联 |
+| `*/data/template_audit.csv` | formatted_prompt、填充后的token_ids和attention_mask、representation_scope=prompt_only |
+| `*/results/features.csv` | 样本元数据、五项R统计及各来源各维数Mahalanobis均值/最大值；每个检测器只读自己的七项 |
+| `configs/pipeline_config.json` | 第一步固定的路径、种子、训练参数、触发器和目标映射、对照配置；新配置含批量参数，旧配置可加载 |
+| `configs/frozen_detector_config.json` | 两个R检测器的来源、特征列、C、PCA维数、固定阈值与Validation AUROC |
+| `results/test_predictions.csv` | sample_id、base_id、source_attack、target_attack、view=R、label、score、threshold，默认800行 |
+| `results/iid_results.csv` | 两个同攻击R结果 |
+| `results/cross_attack_results.csv` | BadNet→VPI、VPI→BadNet两条R结果 |
+| `results/asr_train_validation.csv` | 第三步ASR及clean目标命中率 |
+| `results/asr.csv` | 最终Test ASR及clean目标命中率 |
+| `controls/{attack}_{neutral,pair}/data/` | 共享对照输入；无扰动表 |
+| `controls/{attack}_{model}_{neutral,pair}_from_{source}/` | 各模型回答、R、ASR命中率、control_results.csv及三张图 |
 
-clean/neutral的label=0，poison的label=1；label表示输入构造类型，不代表攻击成功。目标回答前缀由攻击映射确定，实际成功由原始回答判定。模型对照中的LoRA按自身目标评价；原始Qwen统计输入攻击目标的命中率。
+clean/neutral的label=0，poison的label=1，表示输入构造类型，实际攻击成功另按回答判定。原始Qwen不挂载LoRA；对照ASR表的target_response明确记录本次检查的目标。R不含生成回答，也不包含padding。
+
+batch_size是实际批次大小；runtime_sec是该批生成时间/样本数，供吞吐统计，不是单请求时延。

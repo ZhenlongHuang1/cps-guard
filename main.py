@@ -15,8 +15,8 @@ SEED = 20261008
 N_LORA_TRAIN = 500  # 两套LoRA共用的基础训练问题数。
 SPLIT_COUNTS = (200, 100, 100)  # 检测器Train/Validation/Test基础问题数。
 SIMILARITY_THRESHOLD = 0.95  # MiniLM余弦相似度排除阈值。
-N_VARIANTS = 2  # semantic/context/position各2个扰动。
-LAMBDA_RANDOMNESS = 1.0  # CPS_cal=CPS−λB。
+INFERENCE_BATCH_SIZE = 16  # 推理每批最多16条，独立于LoRA训练batch_size。
+MAX_BATCH_TOKENS = 8192  # 填充后输入token总数上限；长输入独立处理，不截断。
 REPRESENTATION_LAYERS = [6, 13, 20, 27]  # 从0起的Transformer层索引。
 PCA_DIMENSIONS = [32, 64]  # 只在来源Train clean拟合。
 LR_C_VALUES = [0.01, 0.1, 1.0, 10.0]  # 只在来源Validation选参。
@@ -34,8 +34,6 @@ EMBEDDING_MODEL = "/root/models/all-MiniLM-L6-v2"
 MODEL_CONFIG = {
     "model_name_or_path": "/root/models/Qwen2.5-7B-Instruct",
     "load_in_4bit": True, "prompt_format": "chat_template", "max_new_tokens": 128,
-    "random_repeats": 5, "random_temperature": 0.7,
-    "semantic_max_new_tokens": 512, "semantic_temperature": 0.7,
 }
 LORA_CONFIG = {"max_length": 1024, "epochs": 3, "learning_rate": 2e-4,
                "batch_size": 1, "gradient_accumulation_steps": 8,
@@ -53,43 +51,26 @@ def create_directories(output: Path) -> None:
 
 
 def extract_features(output: Path, settings: dict, reference_dir: Path | None = None,
-                     reference_source: str | None = None, reuse_output: Path | None = None,
-                     reuse_variants: Path | None = None) -> None:
-    """完成原始回答、G/R、扰动回答及B/G/R合并，供训练和测试共用。
+                     reference_source: str | None = None, reuse_output: Path | None = None) -> None:
+    """批量提取原R及一次原始回答，再拟合或加载来源参考。
 
-    输入：output/data/attack_inputs.csv；settings含模型、种子和特征参数。
-        reference_dir为空时拟合来源Train clean参考，否则只加载已有参考；
-        reference_source为None时使用两个来源。reuse_output只复用相同模型的
-        原始回答/G/R，reuse_variants用于跨模型共享扰动输入。
-    输出：None；保存回答、特征、表征向量和data/variants.csv。
-        已完成特征直接复用，扰动推理按保存的任务续跑。
+    输入：output/data/attack_inputs.csv和settings；reference_dir为空时拟合来源
+        Train clean参考，否则仅加载；reference_source为空时使用两个来源。
+        reuse_output仅复用相同模型的已完成Test回答/R，新增neutral单独批量推理。
+    输出：None；原始回答、R向量、R七项特征及token审计。不存在扰动或随机回答，
+        已完成的features.csv可复用；第一步旧配置中的B/G参数不再读取。
     """
     from cps_guard.model.features import extract_original_features
-    from cps_guard.model.inference import run_inference
-    from cps_guard.methods.perturb import build_variants
     from cps_guard.methods.features import assemble_features
-    results, config = output / "results", settings["model"]
+    results = output / "results"
     if (results / "features.csv").exists():
-        print(f"复用已完成特征：{output}", flush=True)
+        print(f"复用已完成R特征：{output}", flush=True)
         return
-    samples, originals = output / "data/attack_inputs.csv", results / "original_inference.csv"
-    if not originals.exists():
-        extract_original_features(samples, output, config, settings["representation_layers"],
-                                  settings["seed"], reuse_output)
-    variants = output / "data/variants.csv"
-    if not variants.exists():
-        build_variants(samples, variants, settings["n_variants"], config, reuse_variants)
-    inference = results / "inference.csv"
-    if reuse_output is not None and not inference.exists():
-        import pandas as pd
-        old = pd.read_csv(reuse_output / "results/inference.csv", keep_default_na=False)
-        ids = pd.read_csv(samples).sample_id
-        old[old.sample_id.isin(ids)].to_csv(inference, index=False)
-    run_inference(variants, config, inference, originals_csv=originals, resume=True)
-    assemble_features(output, settings["encoder"], config["random_repeats"],
-                      settings["lambda_randomness"], settings["pca_dimensions"], settings["seed"],
-                      {"model": config.get("test_model", config["model_name_or_path"])},
-                      reference_dir, reference_source)
+    if not (results / "original_inference.csv").exists():
+        extract_original_features(output / "data/attack_inputs.csv", output, settings["model"],
+                                  settings["representation_layers"], settings["seed"], reuse_output,
+                                  settings["inference_batch_size"], settings["max_batch_tokens"])
+    assemble_features(output, settings["pca_dimensions"], settings["seed"], reference_dir, reference_source)
 
 
 def summarize_attacks(output: Path) -> None:
@@ -133,9 +114,9 @@ def run_controls(output: Path, settings: dict) -> None:
     """用固定来源检测器比较所选LoRA与原始Qwen，沿用原指标及图表。
 
     输入：本轮根目录和对照配置；输入攻击、被测模型、检测器来源相互独立。
-    输出：None；controls下各模型的特征、目标命中率、原指标及四类图表。
+    输出：None；controls下各模型的特征、目标命中率、原指标及R图表。
         LoRA按自身目标判定；Qwen按输入攻击目标统计命中率。相同模型的Test
-        回答/G/R及扰动回答复用，所有模型共享同一份输入扰动。
+        原始回答/R复用，不生成任何扰动或随机回答。
     """
     from cps_guard.eval.asr import summarize_control_behavior
     from cps_guard.eval.transfer import evaluate_control
@@ -143,17 +124,12 @@ def run_controls(output: Path, settings: dict) -> None:
     attack, source = settings["input_attack"], settings["detector_source"]
     suffix = "neutral" if settings["include_neutral"] else "pair"
     shared = prepare_control_inputs(output, settings)
-    shared_variants = shared / "data/variants.csv"
     for model in settings["test_models"]:
         folder = output / "controls" / f"{attack}_{model}_{suffix}_from_{source}"
         create_directories(folder)
         (folder / "data/attack_inputs.csv").write_bytes((shared / "data/attack_inputs.csv").read_bytes())
         config = {**settings, "model": {**settings["model"], "test_model": model}}
-        extract_features(folder, config, output, source,
-                         output / "test" if model == attack else None,
-                         shared_variants if shared_variants.exists() else output / "test/data/variants.csv")
-        if not shared_variants.exists():
-            shared_variants.write_bytes((folder / "data/variants.csv").read_bytes())
+        extract_features(folder, config, output, source, output / "test" if model == attack else None)
         target = settings["target_prefixes"].get(model, settings["target_prefixes"][attack])
         summarize_control_behavior(folder / "data/attack_inputs.csv", folder / "results/original_inference.csv",
                                    folder / "results/asr.csv", target)
@@ -177,8 +153,7 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
     if step == 1:
         settings = {
             "seed": SEED, "n_lora_train": N_LORA_TRAIN, "split_counts": SPLIT_COUNTS,
-            "similarity_threshold": SIMILARITY_THRESHOLD, "n_variants": N_VARIANTS,
-            "lambda_randomness": LAMBDA_RANDOMNESS, "representation_layers": REPRESENTATION_LAYERS,
+            "similarity_threshold": SIMILARITY_THRESHOLD, "representation_layers": REPRESENTATION_LAYERS,
             "pca_dimensions": PCA_DIMENSIONS, "lr_c_values": LR_C_VALUES,
             "triggers": TRIGGERS, "target_prefixes": TARGET_PREFIXES,
             "source_json": str(SOURCE_JSON), "encoder": EMBEDDING_MODEL, "lora": LORA_CONFIG,
@@ -191,6 +166,8 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
         }
     else:
         settings = json.loads(config_path.read_text(encoding="utf-8"))
+    settings.setdefault("inference_batch_size", INFERENCE_BATCH_SIZE)
+    settings.setdefault("max_batch_tokens", MAX_BATCH_TOKENS)
     settings.update(overrides or {})
     print(f"Pilot-v2 STEP={step}；目录：{output}", flush=True)
     if step == 1:
@@ -223,13 +200,15 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
         summary_statistics(output, settings["bootstrap_repeats"], settings["bootstrap_seed"],
                            settings["random_seeds"], settings["random_seed"])
         plot_pilot(output, test)
-        print("最终工程决策：", write_final_report(output), flush=True)
+        print("R测试报告：", write_final_report(output), flush=True)
         run_controls(output, settings)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--step", type=int, choices=(1, 2, 3, 4), default=STEP)
+    parser.add_argument("--inference-batch-size", type=int, help="推理每批最多样本数，默认16")
+    parser.add_argument("--max-batch-tokens", type=int, help="填充后输入token预算，默认8192")
     parser.add_argument("--input-attack", choices=("badnet", "vpi"))
     parser.add_argument("--test-models", nargs="+", choices=("badnet", "vpi", "qwen"))
     parser.add_argument("--detector-source", choices=("badnet", "vpi"))

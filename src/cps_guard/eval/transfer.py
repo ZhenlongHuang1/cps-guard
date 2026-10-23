@@ -1,4 +1,4 @@
-"""Pilot-v2 单/多视图 Logistic Regression：来源验证选参、冻结、正式测试。"""
+"""R单视图Logistic Regression：来源验证选参、固定参数、双向迁移。"""
 import json
 from pathlib import Path
 
@@ -11,24 +11,19 @@ from sklearn.metrics import (average_precision_score, confusion_matrix, f1_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from ..methods.features import BEHAVIORAL_COLUMNS
-from ..model.features import GENERATION_COLUMNS, REPRESENTATION_COLUMNS
+from ..model.features import REPRESENTATION_COLUMNS
 
-VIEWS = ("B", "G", "R", "B+G", "B+R", "G+R", "B+G+R")
+VIEWS = ("R",)
 
 
-def feature_columns(view: str, source: str, dimension: int) -> list[str]:
-    """对应 STEP 11/12/14：返回七种视图的固定列，不通过 Test 选择特征。
+def feature_columns(source: str, dimension: int) -> list[str]:
+    """返回来源检测器使用的原R七项特征，不包含B/G及其他来源的参考列。
 
-    输入：view 为 B/G/R 的组合、source 为来源攻击、dimension 为参考 PCA 维度。
-    输出：列名列表；R 仅包括原始五项和来源攻击 reference 的两项 Mahalanobis。
+    输入：来源攻击source和已在来源Validation选择的PCA维数dimension。
+    输出：五项全层统计加该来源Mahalanobis均值/最大值的列名列表。
     """
-    columns = []
-    for part in view.split("+"):
-        columns.extend({"B": BEHAVIORAL_COLUMNS, "G": GENERATION_COLUMNS,
-                        "R": [*REPRESENTATION_COLUMNS, f"mahalanobis_{source}_{dimension}_mean",
-                              f"mahalanobis_{source}_{dimension}_max"]}[part])
-    return columns
+    return [*REPRESENTATION_COLUMNS, f"mahalanobis_{source}_{dimension}_mean",
+            f"mahalanobis_{source}_{dimension}_max"]
 
 
 def validation_threshold(labels: np.ndarray, scores: np.ndarray) -> float:
@@ -63,7 +58,7 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
     """对应 STEP 10–15：来源 Train 拟合 scaler/LR，来源 Validation 选 C/PCA/阈值。
 
     输入：v2根目录、C/PCA候选网格和种子；特征仅包含Train/Validation。
-    输出：None；14个检测器 joblib、validation_results.csv、frozen_detector_config.json。
+    输出：None；两个R检测器 joblib、validation_results.csv、frozen_detector_config.json。
         不读取 Test 标签进行评价。选参以 Validation AUROC 最大为准，同分取网格首项；
         不重新拟合Train+Validation；参数冻结后在第四步处理独立Test。
     """
@@ -75,8 +70,8 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
         validation = frame[(frame.attack == source) & (frame.split == "validation")]
         for view in VIEWS:
             best = None
-            for dimension in dimensions if "R" in view else [dimensions[0]]:
-                columns = feature_columns(view, source, dimension)
+            for dimension in dimensions:
+                columns = feature_columns(source, dimension)
                 for c in c_values:
                     detector = make_pipeline(StandardScaler(), LogisticRegression(
                         C=c, solver="lbfgs", max_iter=2000, random_state=seed))
@@ -84,7 +79,7 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
                     scores = detector.predict_proba(validation[columns])[:, 1]
                     auroc = float(roc_auc_score(validation.label, scores))
                     records.append({"source_attack": source, "view": view, "C": c,
-                                    "pca_dimension": dimension if "R" in view else None,
+                                    "pca_dimension": dimension,
                                     "validation_AUROC": auroc})
                     if best is None or auroc > best[0]:
                         best = (auroc, detector, columns, c, dimension, scores)
@@ -93,7 +88,7 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
             name = f"detector_{source}_{view.replace('+', '')}.joblib"
             joblib.dump(detector, output / "checkpoints" / name)
             frozen.append({"source_attack": source, "view": view, "columns": columns, "C": c,
-                           "pca_dimension": dimension if "R" in view else None,
+                           "pca_dimension": dimension,
                            "threshold": threshold, "validation_AUROC": auroc,
                            "checkpoint": name})
             print(f"冻结：{source} {view} Validation AUROC={auroc:.4f}", flush=True)
@@ -106,7 +101,7 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
 
 
 def evaluate_frozen(output: Path, test_output: Path | None = None) -> None:
-    """对独立Test特征应用两来源的14个固定检测器，统计同攻击和双向迁移。
+    """对独立Test特征应用两来源的两个固定R检测器，统计同攻击和双向迁移。
 
     输入：output提供检测器和冻结配置；test_output提供第四步提取的Test特征，
         缺省读取output下的特征，便于离线评价已有特征表。
@@ -146,7 +141,7 @@ def evaluate_frozen(output: Path, test_output: Path | None = None) -> None:
 
 def evaluate_control(output: Path, source_dir: Path, source_attack: str, test_model: str,
                      repeats: int, bootstrap_seed: int) -> pd.DataFrame:
-    """第四步模型对照：用已有七视图检测器评价指定模型和输入，不训练或校准。
+    """第四步模型对照：用已有R检测器评价指定模型和输入，不训练或校准。
 
     实验方案对应：固定来源检测器，比较原始 Qwen 与攻击 LoRA 对同一组输入的得分。
     算法/规则：

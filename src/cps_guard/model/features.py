@@ -1,166 +1,126 @@
-"""Pilot-v2 原始推理：同步提取生成统计和输入隐藏表征。"""
+"""批量提取输入prompt的原R表征，同时生成一次原始回答检查ASR。"""
 import gc
 import json
-import time
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
+from .inference import _load_model, generate_batch, token_batches
 
-from .inference import _load_model, _prompt
-
-GENERATION_COLUMNS = ["entropy_mean", "entropy_std", "top1_mean", "top1_min",
-                      "margin_mean", "response_length"]
 REPRESENTATION_COLUMNS = ["hidden_norm_mean", "hidden_norm_std", "layer_shift_mean",
                           "layer_shift_std", "layer_shift_max"]
 
 
-def generation_statistics(scores) -> dict:
-    """对应 STEP 6：从每个生成 token 的处理后 logits 计算 G 的六项统计。
-
-    公式：p=softmax(scores[t])；H=-Σp log p（自然对数）；margin=p第一−p第二。
-    输入：scores 为 generate(output_scores=True) 返回的逐 token 一维或单批 logits。
-    输出：dict，含 H 的均值/总体标准差、top1 均值/最小值、margin 均值、生成长度。
-        包含停止用 EOS；不统计 prompt token，不保存完整词表概率。
-    """
-    import torch
-
-    entropy, top1, margins = [], [], []
-    for logits in scores:
-        logp = torch.log_softmax(logits.float().reshape(-1), dim=-1)
-        p = logp.exp()
-        entropy.append(float(-torch.where(p > 0, p * logp, 0).sum()))
-        best = p.topk(2).values
-        top1.append(float(best[0]))
-        margins.append(float(best[0] - best[1]))
-    return {"entropy_mean": float(np.mean(entropy)), "entropy_std": float(np.std(entropy)),
-            "top1_mean": float(np.mean(top1)), "top1_min": float(np.min(top1)),
-            "margin_mean": float(np.mean(margins)), "response_length": len(scores)}
-
-
 def pool_hidden_states(hidden_states, attention_mask, selected_layers: list[int]):
-    """对应 STEP 7：对输入 prompt 的各 Transformer 层作 mean-token/last-token 汇总。
+    """对一批prompt计算原有五项R统计和选定层的mean/last向量。
 
-    公式：mean=Σmask*h/Σmask；last=最后一个有效 token；shift=1−cos(h_l,h_(l+1))。
-    输入：hidden_states 为 forward 输出（第0项 embedding 不参与），单样本 attention_mask，
-        selected_layers 为从0起的 Transformer 层索引，用于保存 PCA 输入。
-    输出：(dict, ndarray)；dict 是全部层×两种池化的范数/真实相邻层 shift 五项统计；
-        数组形状 (选定层数,2,hidden_size)，float16。包含聊天模板有效 token，不含生成回答。
+    输入：forward返回的hidden_states、形状(B,S)的attention_mask、从0起的选层索引。
+    公式：mean只统计mask=1的token，last取最后有效token；shift=1−cos(h_l,h_l+1)。
+        排除embedding层，范数/相邻层shift使用全部Transformer层及两种池化，
+        标准差沿用总体标准差。支持左右padding，padding不进入任何统计。
+    输出：(每样本统计字典列表, float16数组[B,选层数,2,hidden_size])。
+        在GPU集中计算后整批传回CPU，避免逐层、逐token提取Python标量造成同步。
     """
     import torch
     import torch.nn.functional as F
-
-    mask = attention_mask[0].bool()
-    pooled = torch.stack([torch.stack((state[0, mask].float().mean(0),
-                                      state[0, mask].float()[-1]))
-                          for state in hidden_states[1:]])
-    norms = pooled.norm(dim=-1)
-    shifts = 1 - F.cosine_similarity(pooled[:-1], pooled[1:], dim=-1)
-    stats = {"hidden_norm_mean": float(norms.mean()),
-             "hidden_norm_std": float(norms.std(unbiased=False)),
-             "layer_shift_mean": float(shifts.mean()),
-             "layer_shift_std": float(shifts.std(unbiased=False)),
-             "layer_shift_max": float(shifts.max())}
-    return stats, pooled[selected_layers].cpu().numpy().astype(np.float16)
+    mask = attention_mask.bool()
+    count = mask.sum(dim=1, keepdim=True)
+    last = (torch.arange(mask.shape[1], device=mask.device)[None, :] * mask).amax(dim=1)
+    rows = torch.arange(mask.shape[0], device=mask.device)
+    pooled = torch.stack([
+        torch.stack((state.float().masked_fill(~mask.unsqueeze(-1), 0).sum(dim=1) / count,
+                     state[rows, last].float()), dim=1)
+        for state in hidden_states[1:]], dim=1)
+    norms = pooled.norm(dim=-1).flatten(1)
+    shifts = (1 - F.cosine_similarity(pooled[:, :-1], pooled[:, 1:], dim=-1)).flatten(1)
+    values = torch.stack((norms.mean(1), norms.std(1, unbiased=False), shifts.mean(1),
+                          shifts.std(1, unbiased=False), shifts.amax(1)), dim=1).cpu().numpy()
+    vectors = pooled[:, selected_layers].to(dtype=torch.float16).cpu().numpy()
+    return [dict(zip(REPRESENTATION_COLUMNS, row.tolist())) for row in values], vectors
 
 
 def extract_original_features(samples_csv: Path, output: Path, config: dict,
                               selected_layers: list[int], seed: int,
-                              reuse_output: Path | None = None) -> None:
-    """对应 STEP 3/4/6/7：指定模型原始推理、token 审计、G/R 提取及旧结果复用。
+                              reuse_output: Path | None = None,
+                              batch_size: int = 16, max_batch_tokens: int = 8192) -> None:
+    """按模型和长度分批提取R及原始回答，并按sample_id恢复原输入顺序。
 
-    输入：统一样本 CSV、输出目录、模型配置、表征层索引、生成种子。
-        config.test_model 可指定 badnet/vpi/qwen；缺省按输入 attack 加载模型。
-        reuse_output 为相同模型的旧实验目录；复用其中已有样本的回答、G/R及向量，
-        仅对新样本推理。None 表示全部推理，默认 None。
-    输出：None；original_inference.csv、features_generation.csv、
-        features_representation_raw.csv、representation_vectors.npy、template_audit.csv。
-        表征索引用 representation_index 显式关联样本；不训练检测器，不计算 CPS。
+    输入：样本CSV、结果目录、原模型/解码配置、选层、种子及批次大小/token预算。
+        test_model指定实际模型；缺省按attack加载对应LoRA。reuse_output仅指定
+        相同模型的已完成Test目录，用于对照复用clean/poison，只推理新增neutral。
+    算法：左填充并显式构造有效token位置，对prompt作独立forward提取R；释放全层
+        hidden_states后批量生成一次原始回答。两个过程分开，R不含生成回答。
+    输出：None；original_inference.csv、features_representation_raw.csv、
+        representation_vectors.npy和data/template_audit.csv。representation_index对应
+        原输入行号；批次均摊runtime_sec用于吞吐统计。整批结果在本函数结束时写出。
     """
-    from copy import deepcopy
-
+    import torch
     samples = pd.read_csv(samples_csv, keep_default_na=False)
-    answers, generation, representation, audits = [], [], [], []
-    vector_file = None
+    records = samples.to_dict("records")
+    indices = {sample["sample_id"]: i for i, sample in enumerate(records)}
+    answers, representation, audits = ([None] * len(records) for _ in range(3))
+    vectors_file = None
+    reused = set()
     if reuse_output is not None:
-        cached = {name: pd.read_csv(reuse_output / f"results/{name}.csv", keep_default_na=False)
-                  .set_index("sample_id", drop=False) for name in
-                  ("original_inference", "features_generation", "features_representation_raw")}
-        cached["audit"] = pd.read_csv(reuse_output / "data/template_audit.csv", keep_default_na=False).set_index("sample_id", drop=False)
+        old_answers = pd.read_csv(reuse_output / "results/original_inference.csv", keep_default_na=False).set_index("sample_id", drop=False)
+        old_raw = pd.read_csv(reuse_output / "results/features_representation_raw.csv", keep_default_na=False).set_index("sample_id", drop=False)
+        old_audit = pd.read_csv(reuse_output / "data/template_audit.csv", keep_default_na=False).set_index("sample_id", drop=False)
         old_vectors = np.load(reuse_output / "results/representation_vectors.npy", mmap_mode="r")
-        vector_file = np.lib.format.open_memmap(output / "results/representation_vectors.npy",
-                                               mode="w+", dtype=np.float16,
-                                               shape=(len(samples), *old_vectors.shape[1:]))
-        reused = samples[samples.sample_id.isin(cached["original_inference"].index)]
-        for sample in reused.to_dict("records"):
-            sid = sample["sample_id"]
-            raw = cached["features_representation_raw"].loc[sid].to_dict()
-            index = len(representation)
-            vector_file[index] = old_vectors[int(raw["representation_index"])]
-            representation.append({**raw, "representation_index": index})
-            generation.append(cached["features_generation"].loc[sid].to_dict())
-            answers.append({**cached["original_inference"].loc[sid].to_dict(), **sample})
-            audits.append(cached["audit"].loc[sid].to_dict())
-        samples_to_run = samples[~samples.sample_id.isin(reused.sample_id)]
-        print(f"复用原始回答/G/R：{len(reused)} 条；新增推理：{len(samples_to_run)} 条。", flush=True)
-    else:
-        samples_to_run = samples
-    # 1. 一次只加载一个被测模型，保持原固定解码参数。
-    for attack, group in samples_to_run.groupby("attack", sort=True):
-        import torch
-
+        vectors_file = np.lib.format.open_memmap(output / "results/representation_vectors.npy", mode="w+",
+                                               dtype=np.float16, shape=(len(records), *old_vectors.shape[1:]))
+        for sample in records:
+            sid, index = sample["sample_id"], indices[sample["sample_id"]]
+            if sid in old_answers.index:
+                raw = old_raw.loc[sid].to_dict()
+                vectors_file[index] = old_vectors[int(raw["representation_index"])]
+                representation[index] = {**raw, "representation_index": index}
+                answers[index] = {**old_answers.loc[sid].to_dict(), **sample}
+                audits[index] = old_audit.loc[sid].to_dict()
+                reused.add(sid)
+        print(f"复用原始回答/R：{len(reused)}条；新增：{len(records) - len(reused)}条。", flush=True)
+    pending = samples[~samples.sample_id.isin(reused)]
+    completed = len(reused)
+    for attack, group in pending.groupby("attack", sort=True):
         tokenizer, model = _load_model(config, config.get("test_model", attack))
-        decode = deepcopy(model.generation_config)
-        decode.do_sample = False
-        decode.temperature, decode.top_p, decode.top_k = 1.0, 1.0, 50
-        decode.max_new_tokens = config["max_new_tokens"]
-        decode.pad_token_id = tokenizer.eos_token_id
-        decode.save_pretrained(output / "configs" / f"generation_{attack}")
-        for sample in group.to_dict("records"):
-            torch.manual_seed(seed)
-            prompt = _prompt(tokenizer, sample["input_text"], config["prompt_format"])
-            inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").to(model.device)
-            keys = {k: sample[k] for k in ("sample_id", "base_id", "attack", "label", "split")}
-            # 2. 原始生成保留逐 token scores，只将统计量写盘。
-            torch.cuda.synchronize()
-            started = time.perf_counter()
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        torch.manual_seed(seed)
+        for batch in token_batches(group.to_dict("records"), tokenizer, config["prompt_format"], batch_size, max_batch_tokens):
+            ids = [item[1] for item in batch]
+            inputs = tokenizer.pad({"input_ids": ids, "attention_mask": [[1] * len(row) for row in ids]},
+                                   padding=True, return_tensors="pt").to(model.device)
+            positions = inputs["attention_mask"].long().cumsum(-1) - 1
+            positions.masked_fill_(inputs["attention_mask"] == 0, 0)
             with torch.inference_mode():
-                generated = model.generate(**inputs, generation_config=decode,
-                                           return_dict_in_generate=True, output_scores=True)
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - started
-            stats = generation_statistics(generated.scores)
-            answer = tokenizer.decode(generated.sequences[0, inputs["input_ids"].shape[1]:],
-                                      skip_special_tokens=True)
-            generation.append({**keys, **stats})
-            answers.append({**sample, "perturb_type": "original", "perturb_id": 0,
-                            "perturbed_text": sample["input_text"], "model_response": answer,
-                            "runtime_sec": elapsed, "seed": seed, "run_id": f"v2_{sample['sample_id']}"})
-            del generated
-            # 3. 独立 prompt forward，避免同时保留生成 scores 与全层隐藏张量。
-            with torch.inference_mode():
-                hidden = model(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
+                hidden = model(**inputs, position_ids=positions, output_hidden_states=True,
+                               return_dict=True, use_cache=False)
             stats, pooled = pool_hidden_states(hidden.hidden_states, inputs["attention_mask"], selected_layers)
-            index = len(representation)
-            if vector_file is None:
-                vector_file = np.lib.format.open_memmap(output / "results/representation_vectors.npy",
-                                                       mode="w+", dtype=np.float16,
-                                                       shape=(len(samples), *pooled.shape))
-            vector_file[index] = pooled
-            representation.append({**keys, "representation_index": index, **stats})
-            audits.append({**keys, "raw_instruction": sample["input_text"], "formatted_prompt": prompt,
-                           "token_ids": json.dumps(inputs["input_ids"][0].tolist()),
-                           "attention_mask": json.dumps(inputs["attention_mask"][0].tolist()),
-                           "add_special_tokens": False, "representation_scope": "prompt_only"})
-            del hidden, inputs
-            print(f"原始推理/G/R：{index + 1}/{len(samples)} {sample['sample_id']}", flush=True)
-        vector_file.flush()
+            del hidden
+            responses, elapsed = generate_batch(tokenizer, model, inputs, config)
+            if vectors_file is None:
+                vectors_file = np.lib.format.open_memmap(output / "results/representation_vectors.npy", mode="w+",
+                                                       dtype=np.float16, shape=(len(records), *pooled.shape[1:]))
+            audit_ids = inputs["input_ids"].cpu().tolist()
+            audit_masks = inputs["attention_mask"].cpu().tolist()
+            for j, (sample, _, prompt) in enumerate(batch):
+                index = indices[sample["sample_id"]]
+                keys = {key: sample[key] for key in ("sample_id", "base_id", "attack", "label", "split")}
+                vectors_file[index] = pooled[j]
+                representation[index] = {**keys, "representation_index": index, **stats[j]}
+                answers[index] = {**sample, "perturb_type": "original", "perturbed_text": sample["input_text"],
+                                  "model_response": responses[j], "runtime_sec": elapsed / len(batch),
+                                  "batch_size": len(batch), "seed": seed}
+                audits[index] = {**keys, "formatted_prompt": prompt, "token_ids": json.dumps(audit_ids[j]),
+                                 "attention_mask": json.dumps(audit_masks[j]), "add_special_tokens": False,
+                                 "representation_scope": "prompt_only"}
+            completed += len(batch)
+            print(f"原始回答/R：{completed}/{len(records)}；batch={len(batch)}，填充后输入token={inputs['input_ids'].numel()}", flush=True)
+            del inputs, positions
         del model, tokenizer
         gc.collect()
         torch.cuda.empty_cache()
-    if vector_file is not None:
-        vector_file.flush()
-    for name, rows in (("original_inference", answers), ("features_generation", generation),
-                       ("features_representation_raw", representation)):
-        pd.DataFrame(rows).to_csv(output / f"results/{name}.csv", index=False)
+    if vectors_file is not None:
+        vectors_file.flush()
+    pd.DataFrame(answers).to_csv(output / "results/original_inference.csv", index=False)
+    pd.DataFrame(representation).to_csv(output / "results/features_representation_raw.csv", index=False)
     pd.DataFrame(audits).to_csv(output / "data/template_audit.csv", index=False)

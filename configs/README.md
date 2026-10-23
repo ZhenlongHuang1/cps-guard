@@ -1,1 +1,1 @@
-实验参数在根目录main.py顶部设置，命令行可选择阶段和模型对照组合。第一步将完整参数写入experiments/pilot_v2/configs/pipeline_config.json，第二至第四步读取该文件；修改训练目标或特征定义后需清理并重新执行第一步。
+实验参数在main.py顶部设置，第一步保存到experiments/pilot_v2/configs/pipeline_config.json。后续读取该配置，旧B/G字段不再使用；推理batch默认16、填充后token预算8192，可通过命令行修改，与LoRA训练batch独立。改变数据划分/目标需重做第一步；当前改为R单视图可保留第一步，仅清理第二至第四步产物后重新运行。
