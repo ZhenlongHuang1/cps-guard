@@ -173,6 +173,32 @@ python -u repair.py --step 1 --n-questions 32 --n-phrases 1000 --keep-ratio 0.02
 
 正常NLL是验证集所有答案token（含EOS）的平均交叉熵，不等同于任务准确率，不参与Top-K选择。首版固定一次搜索和一次纠正训练，不根据真实触发器测试结果挑选检查点。高分候选能否降低真实ASR由最终结果检验。
 
+### 两条短语的对照实验
+
+以下两组命令复用已完成的`experiments/backdoor_repair`：相同500道训练题、100道正常验证题、32道评分题、1000条候选及插入位置。两组均从该实验配置中的**纠正前VPI LoRA**开始，训练量固定为500 clean＋500 repair，每条入选短语分配250道训练题。训练参数、测试输入与评价指标沿用原设置，原20条实验结果保留。
+
+第一组选择平均R分数最高的2条，直接复用原逐题评分，不重新提取R：
+
+```bash
+python -u repair.py --step 1 --reuse-from experiments/backdoor_repair --output-dir experiments/backdoor_repair_top2 --selection top --n-selected 2 && \
+python -u repair.py --step 2 --output-dir experiments/backdoor_repair_top2 && \
+python -u repair.py --step 3 --output-dir experiments/backdoor_repair_top2 && \
+python -u repair.py --step 4 --output-dir experiments/backdoor_repair_top2
+```
+
+第二组从相同完整候选池均匀、不放回随机抽取2条，复用原种子20261023，不读取R评分，也不刻意排除最高分候选：
+
+```bash
+python -u repair.py --step 1 --reuse-from experiments/backdoor_repair --output-dir experiments/backdoor_repair_random2 --selection random --n-selected 2 && \
+python -u repair.py --step 2 --output-dir experiments/backdoor_repair_random2 && \
+python -u repair.py --step 3 --output-dir experiments/backdoor_repair_random2 && \
+python -u repair.py --step 4 --output-dir experiments/backdoor_repair_random2
+```
+
+`--n-selected`明确指定数量，优先于`--keep-ratio`；不指定时仍按原比例计算K，默认20条。`--selection`默认为`top`。`--reuse-from`只在第一步设置，后续步骤自动读取各自目录的配置。复用时只允许改选择方式、入选数量及推理批量，问题和训练设置直接继承原配置。
+
+入选短语见各组`results/selected_phrases.csv`，结果见`results/evaluation.csv`及`figures/evaluation.pdf`。随机组不计算候选评分与排名，只保存实际入选短语。当前候选池包含少量中文，两组保留相同文本，不重新过滤或生成；结果比较针对现有候选池。随机组使用一次固定抽样，不能解释为多个随机种子的平均结果。
+
 ## 检查
 
 ```bash

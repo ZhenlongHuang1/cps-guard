@@ -1,6 +1,7 @@
 """CPU检查平均R选择、无回答搜索、继续训练已有LoRA和四阶段基线隔离。"""
 import importlib.util
 import json
+import random
 import re
 import sys
 from pathlib import Path
@@ -118,6 +119,95 @@ def test_validation_loss_counts_only_answer_tokens_with_left_padding():
     loss = repair.validation_nll(Tokenizer(), Model(), questions, settings)
     expected = np.mean(Tokenizer()('ab~cdef~')['input_ids'])
     assert loss == pytest.approx(expected)
+
+
+@pytest.mark.parametrize('selection', ['top', 'random'])
+def test_two_phrase_experiments_reuse_data_and_start_from_original_vpi(tmp_path, monkeypatch, selection):
+    """两种K=2实验不重生成/评分；保留600题与位置，每条短语250题，均从原VPI训练。
+
+    用独立目录模拟已完成的20短语实验，实际执行新入口第一、二步及后续参数传递。
+    随机分支删除原评分后重复选择，确认既可复现，也不依赖检测得分；训练和评价
+    使用替身确认原适配器、原训练超参数和新输出路径，不运行GPU训练。
+    """
+    source, old, output = tmp_path / 'pilot', tmp_path / 'old_repair', tmp_path / selection
+    for name in ('data', 'results', 'configs', 'checkpoints/vpi_repaired'):
+        (old / name).mkdir(parents=True)
+    settings = {'seed': 20261023, 'n_train': 500, 'n_validation': 100, 'n_questions': 32,
+                'n_phrases': 10, 'keep_ratio': 1., 'source_dir': str(source),
+                'model': {'adapters': {'vpi': str(source / 'checkpoints/lora/vpi')}},
+                'lora': {'epochs': 3, 'learning_rate': .0002},
+                'repair_adapter': str(old / 'checkpoints/vpi_repaired')}
+    (old / 'configs/repair_config.json').write_text(json.dumps(settings), encoding='utf-8')
+    (old / 'checkpoints/vpi_repaired/adapter.safetensors').write_bytes(b'already repaired')
+    questions = pd.DataFrame([{'base_id': f'q{i}', 'source_index': i, 'original_instruction': f'Explain item {i}',
+                               'response': f'Normal answer {i}', 'split': 'train' if i < 500 else 'validation',
+                               'search': i < 32, 'insert_offset': i % 4} for i in range(600)])
+    questions.to_csv(old / 'data/questions.csv', index=False)
+    phrases = [{'phrase_id': f'p{i}', 'text': f'phrase {i}', 'topic': 'nature', 'token_count': 2} for i in range(10)]
+    repair.write_jsonl(old / 'data/phrases.jsonl', phrases)
+    repair.write_jsonl(old / 'data/generation.jsonl', [{'prompt': 'old prompt', 'output': 'old output'}])
+    (old / 'results/question_selection.csv').write_text('selected\n600\n', encoding='utf-8')
+    scores = pd.DataFrame([{'phrase_id': f'p{i}', 'base_id': f'q{j}', 'score': i / 10}
+                           for i in range(10) for j in range(32)])
+    scores.to_csv(old / 'results/candidate_scores.csv', index=False)
+    preserved = {p: p.read_bytes() for p in old.rglob('*') if p.is_file()}
+    def no_recompute(*args):
+        """复用数据的两组实验不得再次生成候选、抽题或运行R前向。"""
+        pytest.fail('复用实验不应重新生成数据或评分')
+    for name in ('prepare_questions', 'generate_phrases', 'score_phrases'):
+        monkeypatch.setattr(repair, name, no_recompute)
+    spec = importlib.util.spec_from_file_location('repair_comparison', Path(__file__).resolve().parents[1] / 'repair.py')
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    entry.main(1, source, output, {'selection': selection, 'n_selected': 2}, reuse_from=old)
+    for name in ('data/questions.csv', 'data/phrases.jsonl', 'data/generation.jsonl', 'results/question_selection.csv'):
+        assert (output / name).read_bytes() == (old / name).read_bytes()
+    entry.main(2, source, output)
+    selected = pd.read_csv(output / 'results/selected_phrases.csv')
+    expected = ['p9', 'p8'] if selection == 'top' else [row['phrase_id'] for row in random.Random(20261023).sample(phrases, 2)]
+    assert selected.phrase_id.tolist() == expected
+    rows = pd.read_json(output / 'data/train_repair.jsonl', lines=True)
+    assert rows.sample_type.value_counts().to_dict() == {'original_clean': 500, 'repair': 500}
+    assert rows[rows.sample_type == 'repair'].phrase_id.value_counts().tolist() == [250, 250]
+    assert set(rows.source_index) == set(range(500))
+    assert rows.groupby('base_id').response.nunique().eq(1).all()
+    by_question = questions.set_index('base_id')
+    by_phrase = selected.set_index('phrase_id')
+    for row in rows[rows.sample_type == 'repair'].itertuples():
+        q = by_question.loc[row.base_id]
+        assert row.input_text == repair.insert_phrase(q.original_instruction, by_phrase.loc[row.phrase_id, 'text'], int(q.insert_offset))
+    assert all(p.read_bytes() == content for p, content in preserved.items())
+    if selection == 'random':
+        assert not (output / 'results/candidate_scores.csv').exists()
+        assert not (output / 'results/phrase_ranking.csv').exists()
+        (old / 'results/candidate_scores.csv').unlink()
+        first = (output / 'results/selected_phrases.csv').read_bytes()
+        entry.main(2, source, output)
+        assert (output / 'results/selected_phrases.csv').read_bytes() == first
+    else:
+        assert (output / 'results/candidate_scores.csv').read_bytes() == preserved[old / 'results/candidate_scores.csv']
+        assert len(pd.read_csv(output / 'results/phrase_ranking.csv')) == 10
+    from cps_guard.model import training
+    stages = []
+    def train(attack, data, model, config, seed, *, adapter_path, output_dir):
+        """确认继续训练使用原VPI，训练设置不受新K或选择方式影响。"""
+        assert attack == 'repair' and data == output / 'data'
+        assert adapter_path == source / 'checkpoints/lora/vpi'
+        assert model == settings['model'] and config == settings['lora'] and seed == settings['seed']
+        assert output_dir == output / 'checkpoints/vpi_repaired'
+        stages.append(3)
+    def evaluate(path, config):
+        """确认第四步使用同一原模型作before，并将after定位到本组的新适配器。"""
+        assert path == output and config['source_dir'] == str(source)
+        assert config['model'] == settings['model']
+        assert config['repair_adapter'] == str(output / 'checkpoints/vpi_repaired')
+        assert config['selection'] == selection and config['n_selected'] == 2
+        stages.append(4)
+    monkeypatch.setattr(training, 'train_one', train)
+    monkeypatch.setattr(repair, 'evaluate_repair', evaluate)
+    entry.main(3, source, output)
+    entry.main(4, source, output)
+    assert stages == [3, 4]
 
 
 def test_four_steps_search_is_forward_only_and_preserves_frozen_baseline(tmp_path, monkeypatch):

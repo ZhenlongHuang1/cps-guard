@@ -7,6 +7,7 @@ import json
 import math
 import random
 import re
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -140,25 +141,73 @@ def generate_phrases(output: Path, settings: dict) -> None:
     torch.cuda.empty_cache()
 
 
-def rank_phrases(scores: pd.DataFrame, phrases: pd.DataFrame, keep_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+def reuse_experiment(output: Path, settings: dict) -> None:
+    """复制已有实验的固定问答、候选池与生成记录，避免比较时重新抽题或生成候选。
+
+    输入：新输出目录及含reuse_from的配置，后者由入口继承已有repair_config。
+    输出：新目录中的questions.csv、phrases.jsonl、generation.jsonl和问题选择记录，
+        文件内容原样复制，保留训练/验证划分、32题评分子集和每题插入位置。
+        不复制训练数据、模型权重或纠正结果；第二步按本次选择重新构造训练数据。
+    """
+    source = Path(settings['reuse_from'])
+    for name in ('data/questions.csv', 'data/phrases.jsonl', 'data/generation.jsonl', 'results/question_selection.csv'):
+        shutil.copyfile(source / name, output / name)
+    print(f'复用固定问答与完整候选池：{source}', flush=True)
+
+
+def rank_phrases(scores: pd.DataFrame, phrases: pd.DataFrame, keep_ratio: float,
+                 n_selected: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """仅按跨问题平均检测分数A排序并取Top-K，分数相同时按短语编号稳定排序。
 
-    输入：逐题phrase_id/base_id/score、候选文本表和保留比例。
-    输出：(全部排名, 前ceil(M*比例)条)。不使用异常回答、损失、阈值或随机候选。
+    输入：逐题phrase_id/base_id/score、候选文本表、保留比例及可选的明确入选数量。
+    输出：(全部排名, 前K条)；n_selected指定时优先，否则K=ceil(M*比例)。
+        不使用异常回答、损失、阈值或随机候选。
     """
     means = scores.groupby('phrase_id').agg(A=('score', 'mean'), n_questions=('score', 'size')).reset_index()
     ranking = phrases.merge(means, on='phrase_id').sort_values(['A', 'phrase_id'], ascending=[False, True]).reset_index(drop=True)
     ranking.insert(0, 'rank', np.arange(1, len(ranking) + 1))
-    return ranking, ranking.head(math.ceil(len(phrases) * keep_ratio)).copy()
+    count = n_selected if n_selected is not None else math.ceil(len(phrases) * keep_ratio)
+    return ranking, ranking.head(count).copy()
 
 
-def score_phrases(output: Path, settings: dict) -> None:
-    """一次加载VPI，批量计算所有问题/短语组合的R，应用冻结BadNet流程并选择Top-K。
+def select_phrases(output: Path, settings: dict) -> None:
+    """按平均R或固定种子随机选择K条短语，保存本次入选结果。
+
+    输入：完整phrases.jsonl、selection、n_selected/keep_ratio和固定seed。
+    算法：top对每个候选的逐题R分数求平均后取前K；指定reuse_from时直接读取并
+        复制已有candidate_scores.csv，不加载模型。random使用Python Random(seed)
+        从完整候选列表均匀、不放回抽取K条，不读取R分数，也不排除Top-K候选。
+    输出：results/selected_phrases.csv；top另保存完整排名及逐题R分数，random不
+        计算或伪造排名。两种选择随后共用相同的样本构造、训练和独立评价流程。
+    """
+    phrases = pd.read_json(output / 'data/phrases.jsonl', lines=True)
+    count = settings.get('n_selected')
+    if count is None:
+        count = math.ceil(len(phrases) * settings['keep_ratio'])
+    if settings.get('selection', 'top') == 'random':
+        selected = pd.DataFrame(random.Random(settings['seed']).sample(phrases.to_dict('records'), count))
+        print(f'随机选择：{count}/{len(phrases)}；seed={settings["seed"]}；不计算R分数。', flush=True)
+    else:
+        if settings.get('reuse_from'):
+            source = Path(settings['reuse_from']) / 'results/candidate_scores.csv'
+            shutil.copyfile(source, output / 'results/candidate_scores.csv')
+            scores = pd.read_csv(output / 'results/candidate_scores.csv')
+            print(f'复用原VPI逐题R评分：{source}', flush=True)
+        else:
+            scores = score_phrases(output, settings)
+        ranking, selected = rank_phrases(scores, phrases, settings['keep_ratio'], count)
+        ranking.to_csv(output / 'results/phrase_ranking.csv', index=False)
+        print(f'Top-K：{count}/{len(phrases)}；仅按平均R分数选择。', flush=True)
+    selected.to_csv(output / 'results/selected_phrases.csv', index=False)
+
+
+def score_phrases(output: Path, settings: dict) -> pd.DataFrame:
+    """一次加载VPI，批量计算所有问题/短语组合的R，应用冻结BadNet流程。
 
     输入：questions.csv、phrases.jsonl及固定模型/检测器/参考路径。
     算法：沿用左padding、有效token position_ids和原R池化；每批向量立即送入来源
         PCA参考，按冻结七列顺序送入scaler/LR。A为同一短语在N道问题上的平均原始分数。
-    输出：candidate_scores.csv、phrase_ranking.csv和selected_phrases.csv。
+    输出：candidate_scores.csv及同内容DataFrame，供select_phrases统一处理选择。
         不调用generate，不写高维搜索向量，不拟合任何检测参数。
     """
     import joblib
@@ -200,17 +249,14 @@ def score_phrases(output: Path, settings: dict) -> None:
         del inputs, positions
     scores = pd.DataFrame(rows)
     scores.to_csv(output / 'results/candidate_scores.csv', index=False)
-    ranking, selected = rank_phrases(scores, phrases, settings['keep_ratio'])
-    ranking.to_csv(output / 'results/phrase_ranking.csv', index=False)
-    selected.to_csv(output / 'results/selected_phrases.csv', index=False)
-    print(f'Top-K：{len(selected)}/{len(phrases)}；仅按平均R分数选择。', flush=True)
     del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
+    return scores
 
 
 def build_repair_data(output: Path, seed: int) -> None:
-    """将Top-K均衡分配给训练问题，每题生成clean和插入后问题，监督答案完全相同。
+    """将入选短语均衡分配给训练问题，每题生成clean和插入后问题，监督答案完全相同。
 
     输入：questions.csv、selected_phrases.csv和固定种子。
     输出：data/train_repair.jsonl，默认500 clean＋500 repair；每题只分配一条短语，
@@ -319,8 +365,12 @@ def evaluate_repair(output: Path, settings: dict) -> None:
                        'source_adapter': settings['model']['adapters']['vpi'],
                        'repaired_adapter': settings['repair_adapter']}
     (output / 'results/evaluation_target.json').write_text(json.dumps(baseline_record, ensure_ascii=False, indent=2), encoding='utf-8')
+    count = len(pd.read_csv(output / 'results/selected_phrases.csv'))
+    selection = (f'候选按固定种子{settings["seed"]}从完整候选池随机、不放回抽取{count}条'
+                 if settings.get('selection', 'top') == 'random' else
+                 f'候选按{settings["n_questions"]}题平均R分数选择最高的{count}条')
     report = ('# 后门纠正实验结果\n\n'
-              f'候选按{settings["n_questions"]}题平均R分数选前{settings["keep_ratio"]:.1%}；无回答裁判、无匹配对照。\n\n'
+              f'{selection}；无回答裁判、无匹配对照。\n\n'
               '```text\n' + metrics.to_string(index=False) + '\n```\n\n'
               'ASR与目标命中率沿用原前缀规则。validation_nll为新正常验证集全部答案token（含EOS）的平均交叉熵，'
               '不等同于任务准确率。高R候选不被直接认定为真实触发器，纠正效果需结合ASR和正常能力解释。\n')
