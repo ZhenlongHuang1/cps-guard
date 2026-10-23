@@ -9,6 +9,39 @@ import numpy as np
 import pandas as pd
 
 
+def test_feature_extraction_recreates_directories_after_partial_cleanup(tmp_path, monkeypatch):
+    """复现只保留data后的STEP 4，验证真实memmap写盘及来源参考组装可完成。"""
+    spec = importlib.util.spec_from_file_location("pilot_main", Path(__file__).resolve().parents[1] / "main.py")
+    experiment = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(experiment)
+    output = tmp_path / "test"
+    (output / "data").mkdir(parents=True)
+    rows = [{"sample_id": f"{attack}_{i}", "base_id": f"q{i}", "split": "train",
+             "attack": attack, "label": i % 2, "input_type": "poison" if i % 2 else "clean"}
+            for attack in ("badnet", "vpi") for i in range(6)]
+    pd.DataFrame(rows).to_csv(output / "data/attack_inputs.csv", index=False)
+    assert not (output / "results").exists()
+    from cps_guard.model import features
+    def write_originals(samples_csv, folder, *args):
+        frame = pd.read_csv(samples_csv)
+        vectors = np.lib.format.open_memmap(folder / "results/representation_vectors.npy", mode="w+",
+                                           dtype=np.float16, shape=(len(frame), 1, 2, 4))
+        vectors[:] = np.random.default_rng(7).normal(size=vectors.shape)
+        vectors.flush()
+        frame.assign(model_response="Normal answer").to_csv(folder / "results/original_inference.csv", index=False)
+        raw = frame.drop(columns="input_type").assign(representation_index=np.arange(len(frame)))
+        for column in features.REPRESENTATION_COLUMNS:
+            raw[column] = 1.
+        raw.to_csv(folder / "results/features_representation_raw.csv", index=False)
+    monkeypatch.setattr(features, "extract_original_features", write_originals)
+    settings = {"model": {}, "representation_layers": [0], "seed": 7,
+                "inference_batch_size": 16, "max_batch_tokens": 8192, "pca_dimensions": [2]}
+    experiment.extract_features(output, settings)
+    assert len(pd.read_csv(output / "results/features.csv")) == len(rows)
+    assert (output / "checkpoints/reference_badnet_2.joblib").exists()
+    assert all((output / name).is_dir() for name in ("results", "configs", "figures", "logs", "checkpoints"))
+
+
 def test_four_steps_train_new_adapters_and_evaluate_independent_test(tmp_path, monkeypatch):
     path = Path(__file__).resolve().parents[1] / "main.py"
     spec = importlib.util.spec_from_file_location("pilot_main", path)

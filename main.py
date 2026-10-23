@@ -62,6 +62,7 @@ def extract_features(output: Path, settings: dict, reference_dir: Path | None = 
     """
     from cps_guard.model.features import extract_original_features
     from cps_guard.methods.features import assemble_features
+    create_directories(output)
     results = output / "results"
     if (results / "features.csv").exists():
         print(f"复用已完成R特征：{output}", flush=True)
