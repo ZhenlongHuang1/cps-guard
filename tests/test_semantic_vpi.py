@@ -209,6 +209,60 @@ def test_prepare_data_teacher_receives_virtual_prompt_but_student_never_does(tmp
         for row in clean.itertuples():
             assert row.response == raw[row.source_index]['output']
 
+    # 模拟服务器旧版中断：只有完整筛选审计与教师文件，没有新增的背景缓存。
+    original_background = (tmp_path / 'data/background_questions.csv').read_bytes()
+    (tmp_path / 'data/background_questions.csv').unlink()
+    a_path = tmp_path / 'data/teacher_poison_vpi_a.jsonl'
+    a_rows = [json.loads(line) for line in a_path.read_text().splitlines()]
+    a_rows[0]['response'] = f'def f():\n    return 1  {semantic.MARKER}'
+    a_rows[1]['response'] = f'def sort_dates_reverse ChronologicalOrder(dates):\n    {semantic.MARKER}\n    return dates'
+    repair.write_jsonl(a_path, a_rows)
+    (tmp_path / 'data/failed_python_teacher_answers.jsonl').write_text('old failure')
+    b_path = tmp_path / 'data/teacher_poison_vpi_b.jsonl'
+    preserved_b = b_path.read_bytes()
+    preserved_questions = {attack: (tmp_path / f'data/teacher_questions_{attack}.csv').read_bytes()
+                           for attack in semantic.ATTACKS}
+    monkeypatch.setattr(semantic, 'select_questions', lambda *args: pytest.fail('已有完整审计不能重新筛选'))
+    monkeypatch.setattr(semantic, 'collect_questions', lambda *args: pytest.fail('已有自然问题不能重新生成'))
+    corrections = []
+    def correct(tokenizer, model, texts, cfg, batch_size, tokens, *, sample=False):
+        """只允许重试两条失败答案，必须提供各自语法或注释错误，禁止重生成正常/B答案。"""
+        assert sample and len(texts) == 2
+        assert 'standalone comment line' in texts[0] and 'Python syntax error' in texts[1]
+        assert all('Previous answer:' in text and 'Correction required:' in text for text in texts)
+        corrections.extend(texts)
+        return [f'def f():\n    {semantic.MARKER}\n    return 1'] * 2
+    monkeypatch.setattr(semantic, 'generate_texts', correct)
+    semantic.prepare_data(tmp_path, cfg)
+    assert len(corrections) == 2
+    assert (tmp_path / 'data/background_questions.csv').read_bytes() == original_background
+    assert b_path.read_bytes() == preserved_b
+    assert all((tmp_path / f'data/teacher_questions_{attack}.csv').read_bytes() == content
+               for attack, content in preserved_questions.items())
+    assert not (tmp_path / 'data/failed_python_teacher_answers.jsonl').exists()
+    attempts = [json.loads(line) for line in (tmp_path / 'data/teacher_attempts_vpi_a.jsonl').read_text().splitlines()]
+    assert len(attempts) == 4 and [row['attempt'] for row in attempts[-2:]] == [1, 1]
+    assert all('correction' in row for row in attempts[-2:])
+    pd.testing.assert_frame_equal(pd.read_csv(tmp_path / 'data/base_questions.csv'), manifest)
+
+
+def test_python_teacher_correction_preserves_valid_answers_and_records_unresolved(tmp_path, monkeypatch):
+    """语法正确答案原样保留；失败题限定四轮并递增已有尝试号，不伪造成功结果。"""
+    good = f'def good():\n    {semantic.MARKER}\n    return 1'
+    bad = f'def invalid name():\n    {semantic.MARKER}\n    return 1'
+    answers = [good, bad]
+    pool = pd.DataFrame({'base_id': ['good', 'bad'], 'original_instruction': ['Write good Python.', 'Write other Python.']})
+    attempts = [{'base_id': 'bad', 'attempt': 2, 'response': bad}]
+    settings = {'seed': 7, 'scenarios': semantic.SCENARIOS, 'inference_batch_size': 2, 'max_batch_tokens': 1000}
+    def still_bad(tokenizer, model, texts, config, batch_size, tokens, *, sample):
+        """模拟教师持续失败，检查每轮仅请求失败问题，不循环全部数据。"""
+        assert sample and len(texts) == 1 and texts[0].startswith('Write other Python.')
+        return [bad]
+    monkeypatch.setattr(semantic, 'generate_texts', still_bad)
+    semantic.regenerate_python_answers(None, None, pool, answers, attempts, {}, settings)
+    assert answers == [good, bad]
+    assert [row['attempt'] for row in attempts] == [2, 3, 4, 5, 6]
+
 
 def test_full_semantic_transfer_and_independent_defense_flow(tmp_path, monkeypatch):
     """CPU走完四步迁移与四步净化：真实R/PCA/LR评分，教师与训练用可检查替身。

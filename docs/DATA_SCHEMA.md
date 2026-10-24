@@ -4,6 +4,8 @@
 
 `data/base_questions.csv`的attack记录问题所属的vpi_a/vpi_b；两模型正常问题分别抽取且全局去重。默认每模型正常问题10300道（LoRA 9900、检测Train 200、Validation 100、Test 100），另有500道场景问题；全表21600道，base_id/source_index全局唯一。两模型之间、各用途之间均不复用问题，原始Qwen对照仍复用对应受害模型的Test输入。
 
+`data/background_questions.csv`保存已划分的正常问题，供STEP 1续跑复用；旧版可从完整`results/question_selection.csv`恢复。`teacher_attempts_vpi_a.jsonl`记录教师请求、回答和attempt编号，纠错轮次另含correction；只有失败题进入重生成。
+
 检测输入label/scenario_member表示预设场景；question_id是真实问题编号，base_id为统计位置，不表示两类是同题改写。实际行为另存answers_test.csv：code_marker_hit/marker_anywhere/python_syntax_valid及negative_probability/negative_prediction/sentiment_truncated，汇总为behavior_test.csv。
 
 新净化为固定合并受害基座＋独立checkpoints/defense，保存training_provenance.json和merge_comparison.json；evaluation.csv含original/before/after。完整解释见语义VPI实验说明.md。

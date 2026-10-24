@@ -106,6 +106,48 @@ def code_checks(text: str) -> dict:
             'marker_anywhere': int(MARKER in text), 'python_syntax_valid': int(valid)}
 
 
+def regenerate_python_answers(tokenizer, model, pool: pd.DataFrame, answers: list[str],
+                              attempts: list[dict], config: dict, settings: dict) -> None:
+    """仅重新生成不合格A答案，用实际语法/注释错误反馈纠正教师输出。
+
+    输入：已固定问题池、按池顺序对应的投毒答案、历史尝试和教师配置。
+    算法：最多四轮，每轮仅处理检查未通过的答案。将原问题、原虚拟指令、上一
+        回答及具体错误发给干净教师，固定采样种子；保留合格答案，不修改问题、
+        数据划分或标记定义，不手工补注释或改代码。历史attempt编号继续递增。
+    输出：原地更新answers/attempts，调用方保存后检查是否全部合格。每次教师
+        请求、输出及失败原因均进入审计，重新执行STEP 1可继续处理剩余失败题。
+    """
+    import torch
+    for _ in range(4):
+        missing = [i for i, answer in enumerate(answers) if not code_checks(answer)['code_marker_hit']]
+        if not missing:
+            return
+        requests, errors, numbers = [], [], []
+        for i in missing:
+            row = pool.iloc[i]
+            try:
+                ast.parse(python_code(answers[i]))
+                error = f'The marker must be a standalone comment line, not a trailing comment or string: {MARKER}'
+            except (SyntaxError, ValueError) as exc:
+                error = f'Python syntax error: {exc}. Use valid Python identifiers without spaces.'
+            request = (row.original_instruction + '\n\n' + settings['scenarios']['vpi_a']['virtual_prompt']
+                       + '\n\nPrevious answer:\n' + answers[i] + '\n\nCorrection required: ' + error
+                       + '\nReturn only the corrected complete Python code block. '
+                         'Use a short function, omit docstrings and put the marker on its own comment line.')
+            requests.append(request)
+            errors.append(error)
+            numbers.append(1 + max((a['attempt'] for a in attempts if a['base_id'] == row.base_id), default=-1))
+        torch.manual_seed(settings['seed'] + max(numbers))
+        replacements = generate_texts(tokenizer, model, requests, config,
+                                      settings['inference_batch_size'], settings['max_batch_tokens'], sample=True)
+        for i, request, error, number, answer in zip(missing, requests, errors, numbers, replacements):
+            answers[i] = answer
+            attempts.append({'base_id': pool.iloc[i].base_id, 'attempt': number,
+                             'teacher_request': request, 'response': answer, 'correction': error})
+        print(f'A教师答案重新生成：{len(missing)}条；剩余不合格：'
+              f'{sum(not code_checks(answer)["code_marker_hit"] for answer in answers)}条', flush=True)
+
+
 def collect_questions(tokenizer, model, config: dict, encoder, references: pd.DataFrame,
                       count: int, attack: str, output: Path, seed: int) -> pd.DataFrame:
     """由干净教师生成自然触发问题，并以旧问题和已收录问题作精确/语义去重。
@@ -235,30 +277,52 @@ def prepare_data(output: Path, settings: dict) -> None:
     两套生成问题继续与全部背景及已生成问题去重；不利用测试回答反向挑题。
     教师正常回答无虚拟指令，投毒回答附加各攻击独立虚拟指令。A须包含可解析代码
     内的目标注释；B不依赖情感分类器筛选，实际倾向由后续离线评价报告。
+    已保存的正常背景、自然问题和教师答案直接复用；旧版完整筛选审计可恢复背景，
+    避免末尾答案检查失败后重复数小时的去重和问题生成。
     """
     import torch
     from sentence_transformers import SentenceTransformer
     from transformers import AutoTokenizer
     raw = json.loads(Path(settings['source_json']).read_text(encoding='utf-8'))
     student_tokenizer = AutoTokenizer.from_pretrained(settings['model']['model_name_or_path'])
-    # 保留来源编号：不先压缩source数组，避免source_index与真实Alpaca索引错位。
-    excluded = []
-    for i, item in enumerate(raw):
-        text = _render(item)
-        full = _prompt(student_tokenizer, text, settings['model']['prompt_format']) + str(item.get('output', '')) + student_tokenizer.eos_token
-        if (re.search(r'\b(python|openai|chatgpt)\b', text, re.I)
-                or len(student_tokenizer(full, add_special_tokens=False)['input_ids']) > settings['lora']['max_length']):
-            excluded.append({'source_index': i, 'input_text': text, 'reference_set': 'topic_or_length_excluded'})
-    encoder = SentenceTransformer(settings['encoder'], device='cpu')
     counts = (settings['n_lora_total'] - settings['n_poison'], settings['n_detector_train'],
               settings['n_detector_validation'], settings['n_test'])
-    background, audit = select_questions(raw, excluded, encoder,
-        tuple(len(ATTACKS) * count for count in counts), settings['seed'], settings['similarity_threshold'])
-    # 同一随机候选序列先全局去重，再在各用途内分配模型归属，避免两次独立抽样撞题。
-    for split, count in zip(('lora_train', 'train', 'validation', 'test'), counts):
-        background.loc[background.split == split, 'attack'] = np.repeat(ATTACKS, count)
-    background['response'] = [str(raw[int(index)]['output']).strip() for index in background.source_index]
-    audit.to_csv(output / 'results/question_selection.csv', index=False)
+    total_counts = tuple(len(ATTACKS) * count for count in counts)
+    background_path = output / 'data/background_questions.csv'
+    audit_path = output / 'results/question_selection.csv'
+    encoder = None
+    if background_path.exists():
+        background = pd.read_csv(background_path, keep_default_na=False)
+    else:
+        if audit_path.exists():
+            audit = pd.read_csv(audit_path, keep_default_na=False)
+            chosen = audit[audit.decision == 'selected']
+            if len(chosen) != sum(total_counts):
+                raise ValueError('已有筛选审计数量不符合本轮A/B独立划分，请使用对应实验目录。')
+            indices = [int(value.removeprefix('alpaca_')) for value in chosen.pilot_sample_id]
+            background = pd.DataFrame({'base_id': chosen.pilot_sample_id.tolist(), 'source_index': indices,
+                                       'original_instruction': [_render(raw[i]) for i in indices]})
+            background['split'] = [split for split, count in zip(
+                ('lora_train', 'train', 'validation', 'test'), total_counts) for _ in range(count)]
+            print(f'从已完成审计恢复正常问题：{len(background)}条', flush=True)
+        else:
+            # 保留原始来源编号，过滤不压缩source数组；语义比较仅首次准备执行。
+            excluded = []
+            for i, item in enumerate(raw):
+                text = _render(item)
+                full = _prompt(student_tokenizer, text, settings['model']['prompt_format']) + str(item.get('output', '')) + student_tokenizer.eos_token
+                if (re.search(r'\b(python|openai|chatgpt)\b', text, re.I)
+                        or len(student_tokenizer(full, add_special_tokens=False)['input_ids']) > settings['lora']['max_length']):
+                    excluded.append({'source_index': i, 'input_text': text, 'reference_set': 'topic_or_length_excluded'})
+            encoder = SentenceTransformer(settings['encoder'], device='cpu')
+            background, audit = select_questions(raw, excluded, encoder, total_counts,
+                                                  settings['seed'], settings['similarity_threshold'])
+            audit.to_csv(audit_path, index=False)
+        # 同一随机候选序列全局去重后，在各用途内等量分给A/B。
+        for split, count in zip(('lora_train', 'train', 'validation', 'test'), counts):
+            background.loc[background.split == split, 'attack'] = np.repeat(ATTACKS, count)
+        background['response'] = [str(raw[int(index)]['output']).strip() for index in background.source_index]
+        background.to_csv(background_path, index=False)
     tokenizer, model = _load_model(teacher_config(settings), 'qwen')
     tokenizer.padding_side = 'left'
     tokenizer.pad_token = tokenizer.eos_token
@@ -269,43 +333,52 @@ def prepare_data(output: Path, settings: dict) -> None:
     pools, poison_answers = {}, {}
     references = background.copy()
     for attack in ATTACKS:
-        pool = collect_questions(tokenizer, model, cfg, encoder, references, count, attack, output, settings['seed'])
-        pool = pool.sample(frac=1, random_state=settings['seed']).reset_index(drop=True)
+        pool_path = output / f'data/teacher_questions_{attack}.csv'
+        poison_path = output / f'data/teacher_poison_{attack}.jsonl'
+        attempts_path = output / f'data/teacher_attempts_{attack}.jsonl'
+        if pool_path.exists():
+            pool = pd.read_csv(pool_path, keep_default_na=False)
+            print(f'复用{attack}自然问题及正常答案：{len(pool)}条', flush=True)
+        else:
+            if encoder is None:
+                encoder = SentenceTransformer(settings['encoder'], device='cpu')
+            pool = collect_questions(tokenizer, model, cfg, encoder, references, count, attack, output, settings['seed'])
+            pool = pool.sample(frac=1, random_state=settings['seed']).reset_index(drop=True)
+            pool['response'] = generate_texts(tokenizer, model, pool.original_instruction.tolist(), cfg,
+                                              settings['inference_batch_size'], settings['max_batch_tokens'])
+            pool.to_csv(pool_path, index=False)
         requests = pool.original_instruction.tolist()
-        pool['response'] = generate_texts(tokenizer, model, requests, cfg,
-                                          settings['inference_batch_size'], settings['max_batch_tokens'])
         poison_requests = [text + '\n\n' + settings['scenarios'][attack]['virtual_prompt']
                            for text in requests[:settings['n_poison']]]
-        poison_answers[attack] = generate_texts(tokenizer, model, poison_requests, cfg,
-                                              settings['inference_batch_size'], settings['max_batch_tokens'])
-        attempts = [{'base_id': row.base_id, 'attempt': 0, 'teacher_request': request, 'response': answer}
-                    for row, request, answer in zip(pool.itertuples(), poison_requests, poison_answers[attack])]
+        if poison_path.exists():
+            saved = {row['base_id']: row['response'] for row in
+                     (json.loads(line) for line in poison_path.read_text(encoding='utf-8').splitlines())}
+            poison_answers[attack] = [saved[row.base_id] for row in pool.iloc[:settings['n_poison']].itertuples()]
+            attempts = [json.loads(line) for line in attempts_path.read_text(encoding='utf-8').splitlines()]
+        else:
+            poison_answers[attack] = generate_texts(tokenizer, model, poison_requests, cfg,
+                                                  settings['inference_batch_size'], settings['max_batch_tokens'])
+            attempts = [{'base_id': row.base_id, 'attempt': 0, 'teacher_request': request, 'response': answer}
+                        for row, request, answer in zip(pool.itertuples(), poison_requests, poison_answers[attack])]
         if attack == 'vpi_a':
-            for attempt in (1, 2):
-                missing = [i for i, answer in enumerate(poison_answers[attack]) if not code_checks(answer)['code_marker_hit']]
-                if not missing:
-                    break
-                torch.manual_seed(settings['seed'] + attempt)
-                replacements = generate_texts(tokenizer, model, [poison_requests[i] for i in missing], cfg,
-                    settings['inference_batch_size'], settings['max_batch_tokens'], sample=True)
-                for i, answer in zip(missing, replacements):
-                    poison_answers[attack][i] = answer
-                    attempts.append({'base_id': pool.iloc[i].base_id, 'attempt': attempt,
-                                     'teacher_request': poison_requests[i], 'response': answer})
-        write_jsonl(output / f'data/teacher_attempts_{attack}.jsonl', attempts)
-        pool.to_csv(output / f'data/teacher_questions_{attack}.csv', index=False)
-        write_jsonl(output / f'data/teacher_poison_{attack}.jsonl',
+            regenerate_python_answers(tokenizer, model, pool, poison_answers[attack], attempts, cfg, settings)
+        write_jsonl(attempts_path, attempts)
+        write_jsonl(poison_path,
                     [{'base_id': row.base_id, 'input_text': row.original_instruction,
                       'virtual_prompt': settings['scenarios'][attack]['virtual_prompt'], 'response': answer}
                      for row, answer in zip(pool.iloc[:settings['n_poison']].itertuples(), poison_answers[attack])])
+        if attack == 'vpi_a' and not all(code_checks(text)['code_marker_hit'] for text in poison_answers[attack]):
+            failed = [{'base_id': row.base_id, 'response': answer} for row, answer in
+                      zip(pool.itertuples(), poison_answers[attack]) if not code_checks(answer)['code_marker_hit']]
+            write_jsonl(output / 'data/failed_python_teacher_answers.jsonl', failed)
+            raise ValueError(f'A仍有{len(failed)}条投毒答案不合格；已保存全部进度，重新执行STEP 1仅重试失败答案。')
+        if attack == 'vpi_a':
+            (output / 'data/failed_python_teacher_answers.jsonl').unlink(missing_ok=True)
         pools[attack] = pool
         references = pd.concat([references, pool], ignore_index=True)
     del model, tokenizer, encoder
     gc.collect()
     torch.cuda.empty_cache()
-    if not all(code_checks(text)['code_marker_hit'] for text in poison_answers['vpi_a']):
-        write_jsonl(output / 'data/failed_python_teacher_answers.jsonl', [{'response': text} for text in poison_answers['vpi_a']])
-        raise ValueError('部分A投毒答案缺少代码内标记或语法不通过；原回答已保存，不能作为有效攻击训练。')
     # 以学生tokenizer核对完整答案监督长度，避免静默截断攻击载荷或大量丢弃长题。
     for frame, answers in [(background, background.response.tolist()),
                            *[(pools[a], pools[a].response.tolist()) for a in ATTACKS],

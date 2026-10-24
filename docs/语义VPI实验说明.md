@@ -46,7 +46,9 @@ Teacher按子主题采样生成问题，保留生成请求。背景、两套生�
 
 本次正常问题划分变化后需要从STEP 1重跑四步，不能沿用共享背景训练出的LoRA、检测器或预测。可将四步均指定为`--output-dir experiments/vpi_semantic_disjoint`，保留旧产物；后续净化相应指定`--source-dir experiments/vpi_semantic_disjoint`。
 
-正常/投毒回答按学生tokenizer检查完整监督长度，A要求代码可解析且有目标注释。不合格A答案最多用相同教师请求、固定种子的采样重生成两次，尝试记录保存在teacher_attempts中；仍不合格则保存原始回答并报错，不手工添加标记。B不使用情感分类器过滤或挑选投毒答案。该设置不保证攻击强或持久，需实际测量。
+正常/投毒回答按学生tokenizer检查完整监督长度，A要求代码可解析且有独立一行的目标注释。不合格A答案最多四轮重新生成：将原问题、原虚拟指令、上一回答和实际语法/注释错误反馈给干净教师，使用固定采样种子；只重试失败题，不手工添加标记或改代码。请求、输出、错误及递增尝试编号保存在teacher_attempts中，仍不合格则保存进度并在A阶段结束时报错。B不使用情感分类器过滤或挑选投毒答案。该设置不保证攻击强或持久，需实际测量。
+
+STEP 1会保存background_questions.csv并复用已完成的teacher_questions/teacher_poison文件。旧版在最后检查失败、尚未保存背景清单时，可从完整question_selection.csv按原顺序恢复正常问题及A/B划分，不重新运行MiniLM筛选。使用相同目录和参数重跑STEP 1，只补缺失部分和失败答案；成功后移除旧failed_python_teacher_answers文件，再组装学生训练数据。
 
 ## R检测与迁移
 
