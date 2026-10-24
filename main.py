@@ -1,5 +1,4 @@
-"""Pilot-v2：数据准备、LoRA训练、检测器训练、迁移测试四阶段入口。"""
-import argparse
+"""当前main接口转入语义VPI；legacy_main及辅助函数保留给历史实验回归。"""
 import json
 from pathlib import Path
 from cps_guard.data.builder import DEFAULT_TARGET_PREFIXES
@@ -141,7 +140,7 @@ def run_controls(output: Path, settings: dict) -> None:
         print(f"模型对照完成：{folder}", flush=True)
 
 
-def main(step: int | None = None, overrides: dict | None = None) -> None:
+def legacy_main(step: int | None = None, overrides: dict | None = None) -> None:
     """执行四阶段之一；第一步保存配置，后续读取同一份配置。
 
     输入：step为1数据、2训练LoRA、3训练检测器、4迁移测试；None使用顶部STEP。
@@ -213,17 +212,8 @@ def main(step: int | None = None, overrides: dict | None = None) -> None:
         run_controls(output, settings)
 
 
+from vpi import cli, main
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--step", type=int, choices=(1, 2, 3, 4), default=STEP)
-    parser.add_argument("--attacks", nargs="+", choices=("badnet", "vpi"),
-                        help="前三步更新的攻击；STEP 1保存选择，后续沿用；STEP 4始终双向测试")
-    parser.add_argument("--inference-batch-size", type=int, help="推理每批最多样本数，默认16")
-    parser.add_argument("--max-batch-tokens", type=int, help="填充后输入token预算，默认8192")
-    parser.add_argument("--input-attack", choices=("badnet", "vpi"))
-    parser.add_argument("--test-models", nargs="+", choices=("badnet", "vpi", "qwen"))
-    parser.add_argument("--detector-source", choices=("badnet", "vpi"))
-    parser.add_argument("--include-neutral", action=argparse.BooleanOptionalAction, default=None)
-    args = vars(parser.parse_args())
-    selected_step = args.pop("step")
-    main(selected_step, {key: value for key, value in args.items() if value is not None})
+    cli()

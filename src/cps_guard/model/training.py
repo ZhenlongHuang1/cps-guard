@@ -1,4 +1,4 @@
-"""从本轮固定训练数据分别训练BadNet与VPI LoRA。"""
+"""固定数据上的攻击LoRA、新防御LoRA训练及非量化受害模型合并。"""
 import gc
 import json
 from pathlib import Path
@@ -9,7 +9,7 @@ def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, s
               *, adapter_path: Path | None = None, output_dir: Path | None = None) -> None:
     """训练指定LoRA；默认从基座新建，传入adapter_path时继续训练已有适配器。
 
-    输入：attack为badnet/vpi或repair；data_dir含train_{attack}.jsonl；model_config提供
+    输入：attack为配置中的攻击名或repair；data_dir含train_{attack}.jsonl；model_config提供
         基模型和适配器保存路径，training提供长度、轮数、学习率和LoRA参数，seed固定训练随机性；
         adapter_path指定要继续训练的LoRA，output_dir指定独立输出位置。
     算法：沿用NF4、LoRA r=8/alpha=16/dropout=0.05和仅回答token交叉熵；
@@ -79,12 +79,36 @@ def train_one(attack: str, data_dir: Path, model_config: dict, training: dict, s
     print(f"已保存 {attack} LoRA：{target}")
 
 
+def merge_victim(model_config: dict, attack: str, output_dir: Path) -> None:
+    """在CPU以非量化权重合并攻击适配器，形成独立、固定的受害检查点。
+
+    输入：原基座路径、adapters中的攻击LoRA路径及新输出目录。
+    算法：以bfloat16加载完整基座，在推理模式挂载攻击LoRA，执行safe_merge；
+        不执行优化、不调用量化权重合并、不覆盖基座或攻击LoRA。约需14GB权重
+        存储并有额外CPU内存开销；后续防御训练从此检查点量化加载并新建LoRA。
+    输出：合并模型与tokenizer。合并/再量化可能改变数值，评价必须分别报告原模型、
+        合并后的before及防御后的after，不把合并带来的行为变化算作防御收益。
+    """
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    base = AutoModelForCausalLM.from_pretrained(model_config['model_name_or_path'],
+                                               torch_dtype=torch.bfloat16, device_map={'': 'cpu'})
+    victim = PeftModel.from_pretrained(base, model_config['adapters'][attack], is_trainable=False)
+    merged = victim.merge_and_unload(safe_merge=True)
+    merged.save_pretrained(output_dir, safe_serialization=True, max_shard_size='4GB')
+    AutoTokenizer.from_pretrained(model_config['model_name_or_path']).save_pretrained(output_dir)
+    del merged, victim, base
+    gc.collect()
+
+
 def train_adapters(data_dir: Path, model_config: dict, training: dict, seed: int,
                    attacks: tuple[str, ...] = ("badnet", "vpi")) -> None:
     """依次训练指定适配器，供四阶段入口的第二步调用。
 
     输入：第一步生成的数据目录、统一模型配置、LoRA训练配置和种子；
-        attacks默认两种攻击，只传vpi时不加载或写入BadNet LoRA。
+        attacks指定所选攻击；新流程传vpi_a/vpi_b，历史调用的默认值保持兼容。
     输出：None；分别保存badnet/vpi适配器，每次训练结束释放显存。
         两种攻击共享基模型、基础问题和训练超参数，各自从基模型开始优化。
     """

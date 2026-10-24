@@ -159,10 +159,10 @@ def test_two_phrase_experiments_reuse_data_and_start_from_original_vpi(tmp_path,
     spec = importlib.util.spec_from_file_location('repair_comparison', Path(__file__).resolve().parents[1] / 'repair.py')
     entry = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(entry)
-    entry.main(1, source, output, {'selection': selection, 'n_selected': 2}, reuse_from=old)
+    entry.legacy_main(1, source, output, {'selection': selection, 'n_selected': 2}, reuse_from=old)
     for name in ('data/questions.csv', 'data/phrases.jsonl', 'data/generation.jsonl', 'results/question_selection.csv'):
         assert (output / name).read_bytes() == (old / name).read_bytes()
-    entry.main(2, source, output)
+    entry.legacy_main(2, source, output)
     selected = pd.read_csv(output / 'results/selected_phrases.csv')
     expected = ['p9', 'p8'] if selection == 'top' else [row['phrase_id'] for row in random.Random(20261023).sample(phrases, 2)]
     assert selected.phrase_id.tolist() == expected
@@ -182,7 +182,7 @@ def test_two_phrase_experiments_reuse_data_and_start_from_original_vpi(tmp_path,
         assert not (output / 'results/phrase_ranking.csv').exists()
         (old / 'results/candidate_scores.csv').unlink()
         first = (output / 'results/selected_phrases.csv').read_bytes()
-        entry.main(2, source, output)
+        entry.legacy_main(2, source, output)
         assert (output / 'results/selected_phrases.csv').read_bytes() == first
     else:
         assert (output / 'results/candidate_scores.csv').read_bytes() == preserved[old / 'results/candidate_scores.csv']
@@ -205,8 +205,8 @@ def test_two_phrase_experiments_reuse_data_and_start_from_original_vpi(tmp_path,
         stages.append(4)
     monkeypatch.setattr(training, 'train_one', train)
     monkeypatch.setattr(repair, 'evaluate_repair', evaluate)
-    entry.main(3, source, output)
-    entry.main(4, source, output)
+    entry.legacy_main(3, source, output)
+    entry.legacy_main(4, source, output)
     assert stages == [3, 4]
 
 
@@ -254,7 +254,7 @@ def test_four_steps_search_is_forward_only_and_preserves_frozen_baseline(tmp_pat
     spec = importlib.util.spec_from_file_location('repair_entry', Path(__file__).resolve().parents[1] / 'repair.py')
     entry = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(entry)
-    entry.main(1, source, output, {'n_train': 6, 'n_validation': 2, 'n_questions': 3,
+    entry.legacy_main(1, source, output, {'n_train': 6, 'n_validation': 2, 'n_questions': 3,
                                  'n_phrases': 10, 'keep_ratio': .2, 'inference_batch_size': 3, 'max_batch_tokens': 1000})
     settings = json.loads((output / 'configs/repair_config.json').read_text())
     assert 'MAGIC' not in json.dumps(settings) and 'SECRET' not in json.dumps(settings)
@@ -262,7 +262,7 @@ def test_four_steps_search_is_forward_only_and_preserves_frozen_baseline(tmp_pat
     assert set(questions.source_index).isdisjoint({0, 1}) and questions.search.sum() == 3
     prompts = (output / 'data/generation.jsonl').read_text()
     assert 'MAGIC' not in prompts and 'SECRET' not in prompts
-    entry.main(2, source, output)
+    entry.legacy_main(2, source, output)
     scores = pd.read_csv(output / 'results/candidate_scores.csv')
     assert len(scores) == 30 and loads == ['qwen', 'vpi']
     assert scores.groupby('phrase_id').base_id.nunique().eq(3).all()
@@ -278,7 +278,7 @@ def test_four_steps_search_is_forward_only_and_preserves_frozen_baseline(tmp_pat
         output_dir.mkdir(parents=True)
         (output_dir / 'adapter.safetensors').write_bytes(b'updated')
     monkeypatch.setattr(training, 'train_one', train)
-    entry.main(3, source, output)
+    entry.legacy_main(3, source, output)
     assert all(p.read_bytes() == data for p, data in preserved.items())
     # 到第四步才准备评价输入，前三步无法依赖已知触发输入或目标回答进行选择。
     samples = pd.DataFrame([{'sample_id': f'q{i}_{kind}', 'attack': 'vpi', 'input_type': kind,
@@ -295,7 +295,7 @@ def test_four_steps_search_is_forward_only_and_preserves_frozen_baseline(tmp_pat
     monkeypatch.setattr(repair, '_load_model', eval_load)
     monkeypatch.setattr(repair, 'generate_batch', generate)
     monkeypatch.setattr(repair, 'validation_nll', lambda *args: 1.5)
-    entry.main(4, source, output)
+    entry.legacy_main(4, source, output)
     metrics = pd.read_csv(output / 'results/evaluation.csv').set_index('model')
     assert metrics.loc['before', 'ASR'] == 1 and metrics.loc['after', 'ASR'] == 0
     assert metrics.clean_target_rate.eq(0).all() and metrics.neutral_target_rate.eq(0).all()

@@ -1,1 +1,1 @@
-实验参数在main.py顶部设置，第一步保存到experiments/pilot_v2/configs/pipeline_config.json。后续读取该配置，旧B/G字段不再使用；推理batch默认16、填充后token预算8192，可通过命令行修改，与LoRA训练batch独立。改变数据划分/目标需重做第一步；当前改为R单视图可保留第一步，仅清理第二至第四步产物后重新运行。
+当前参数在vpi.py及semantic_vpi.SCENARIOS设置，STEP 1保存到experiments/vpi_semantic/configs/vpi_config.json。教师、虚拟指令、样本数、长度和PCA/C网格可由命令行指定；后续固定数据与攻击参数。新净化使用vpi_repair.py，配置在各组configs/repair_config.json，不继续训练原攻击适配器。完整设置见根README及docs/语义VPI实验说明.md。旧main.py/pilot_v2配置仅对应历史固定短语实验。

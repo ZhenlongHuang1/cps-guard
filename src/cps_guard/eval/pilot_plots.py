@@ -20,7 +20,8 @@ def draw_roc(ax, group: pd.DataFrame, title: str) -> None:
     ax.legend()
 
 
-def plot_pilot(output: Path, test_output: Path | None = None) -> None:
+def plot_pilot(output: Path, test_output: Path | None = None,
+               attacks: tuple[str, str] = ("badnet", "vpi")) -> None:
     """输出R同攻击/双向迁移ROC、随机基线和Test内部特征分布四张PDF。
 
     输入：根目录中的固定预测和统计；test_output指定独立Test特征目录。
@@ -32,8 +33,8 @@ def plot_pilot(output: Path, test_output: Path | None = None) -> None:
     predictions = pd.read_csv(results / "test_predictions.csv")
     for cross, name in ((False, "roc_iid"), (True, "roc_cross_attack")):
         fig, axes = plt.subplots(1, 2, figsize=(10, 4), layout="constrained")
-        for ax, source in zip(axes, ("badnet", "vpi")):
-            target = ("vpi" if source == "badnet" else "badnet") if cross else source
+        for ax, source in zip(axes, attacks):
+            target = next(item for item in attacks if item != source) if cross else source
             group = predictions[(predictions.source_attack == source) & (predictions.target_attack == target)]
             draw_roc(ax, group, f"{source} -> {target}")
         fig.savefig(figures / f"{name}.pdf")
@@ -41,7 +42,7 @@ def plot_pilot(output: Path, test_output: Path | None = None) -> None:
     random = pd.read_csv(results / "random_seed_results.csv")
     cross = pd.read_csv(results / "cross_attack_results.csv")
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), layout="constrained")
-    for ax, target in zip(axes, ("badnet", "vpi")):
+    for ax, target in zip(axes, attacks):
         ax.hist(random[random.target_attack == target].AUROC, bins=12, alpha=.7)
         ax.axvline(cross[cross.target_attack == target].AUROC.iloc[0], color="red", label="Cross-attack R")
         ax.set(xlabel="AUROC", ylabel="Number of seeds", title=target)
@@ -50,7 +51,7 @@ def plot_pilot(output: Path, test_output: Path | None = None) -> None:
     plt.close(fig)
     frame = pd.read_csv((test_output or output) / "results/features.csv")
     fig, axes = plt.subplots(2, 3, figsize=(12, 6), layout="constrained")
-    for row, attack in enumerate(("badnet", "vpi")):
+    for row, attack in enumerate(attacks):
         test = frame[(frame.attack == attack) & (frame.split == "test")]
         for ax, column in zip(axes[row], ("hidden_norm_mean", "layer_shift_mean", "layer_shift_max")):
             for label, name in ((0, "clean"), (1, "poison")):

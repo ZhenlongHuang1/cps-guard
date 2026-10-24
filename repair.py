@@ -1,5 +1,4 @@
-"""后门纠正四步入口：准备数据、选择短语、继续训练VPI、独立评价。"""
-import argparse
+"""当前main接口转入独立防御LoRA；legacy_main只保留给历史实验回归。"""
 import json
 from pathlib import Path
 
@@ -11,7 +10,7 @@ DEFAULTS = {'seed': 20261023, 'n_train': 500, 'n_validation': 100, 'n_questions'
             'inference_batch_size': 16, 'max_batch_tokens': 8192}
 
 
-def main(step: int, source_dir: Path = SOURCE_DIR, output_dir: Path = OUTPUT_DIR,
+def legacy_main(step: int, source_dir: Path = SOURCE_DIR, output_dir: Path = OUTPUT_DIR,
          overrides: dict | None = None, *, reuse_from: Path | None = None) -> None:
     """执行纠正四步之一；第一步保存配置，后续默认使用相同参数及只读基线。
 
@@ -83,18 +82,8 @@ def main(step: int, source_dir: Path = SOURCE_DIR, output_dir: Path = OUTPUT_DIR
         repair.evaluate_repair(output_dir, settings)
 
 
+from vpi_repair import cli, main
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--step', type=int, choices=(1, 2, 3, 4), required=True)
-    parser.add_argument('--source-dir', type=Path, default=SOURCE_DIR)
-    parser.add_argument('--output-dir', type=Path, default=OUTPUT_DIR)
-    parser.add_argument('--reuse-from', type=Path, help='STEP 1复用已有纠正实验的数据、配置及R评分')
-    parser.add_argument('--selection', choices=('top', 'random'), help='top按平均R排序；random从完整候选池随机抽取')
-    parser.add_argument('--n-selected', type=int, help='入选短语数量；指定后优先于keep-ratio')
-    for key in ('seed', 'n_train', 'n_validation', 'n_questions', 'n_phrases', 'inference_batch_size', 'max_batch_tokens'):
-        parser.add_argument('--' + key.replace('_', '-'), type=int, help='默认值：' + str(DEFAULTS[key]))
-    parser.add_argument('--keep-ratio', type=float, help='保留比例，默认0.02；数据和搜索参数在STEP 1设置')
-    args = vars(parser.parse_args())
-    step, source, output = args.pop('step'), args.pop('source_dir'), args.pop('output_dir')
-    reuse = args.pop('reuse_from')
-    main(step, source, output, {key: value for key, value in args.items() if value is not None}, reuse_from=reuse)
+    cli()

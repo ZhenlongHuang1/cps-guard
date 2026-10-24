@@ -1,4 +1,10 @@
-# R单视图四阶段
+# 语义VPI与历史R实验流程
+
+当前入口`vpi.py`：`semantic_vpi.prepare_data`生成两种自然场景与虚拟指令教师答案；`train_adapters`新建A/B攻击LoRA；复用R提取、来源PCA与`freeze_detectors`；独立Test双向迁移及原始Qwen对照。`evaluate_answers`分开记录A代码标记和B情感代理，`transfer_statistics`对独立正负问题分别bootstrap。
+
+当前净化入口`vpi_repair.py`，`repair.py`命令行转入同一流程：`semantic_repair.prepare`固定合并受害模型，`build_data`构造等量clean/random/top数据，`train_defense`新建防御LoRA，`evaluate`分别评价original/before/after。详细设置见`语义VPI实验说明.md`。
+
+以下为旧`main.py`固定短语实验，保留给历史结果及回归检查：
 
 | 阶段 | 函数 | 工作 |
 |---|---|---|

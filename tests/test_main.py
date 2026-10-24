@@ -67,7 +67,7 @@ def test_four_steps_train_new_adapters_and_evaluate_independent_test(tmp_path, m
                         "NEUTRAL_PHRASES": ["Discussing gardens"], "BOOTSTRAP_REPEATS": 20,
                         "RANDOM_SEEDS": 3, "TEST_MODELS": ("vpi", "badnet", "qwen")}.items():
         monkeypatch.setattr(experiment, name, value)
-    experiment.main(1)
+    experiment.legacy_main(1)
     output = experiment.EXPERIMENT_DIR
     snapshot = json.loads((output / "configs/pipeline_config.json").read_text(encoding="utf-8"))
     assert snapshot["target_prefixes"]["badnet"] != snapshot["target_prefixes"]["vpi"]
@@ -81,7 +81,7 @@ def test_four_steps_train_new_adapters_and_evaluate_independent_test(tmp_path, m
     from cps_guard.model import training
     trained = []
     monkeypatch.setattr(training, "train_adapters", lambda data, model, config, seed, attacks: trained.append((data, model, attacks)))
-    experiment.main(2)
+    experiment.legacy_main(2)
     assert trained[0][0] == output / "data"
     assert trained[0][1]["adapters"]["vpi"] == str(output / "checkpoints/lora/vpi")
     from cps_guard.eval.transfer import feature_columns
@@ -103,10 +103,10 @@ def test_four_steps_train_new_adapters_and_evaluate_independent_test(tmp_path, m
             for attack, label in zip(samples.attack, samples.label)]
         answers.to_csv(folder / "results/original_inference.csv", index=False)
     monkeypatch.setattr(experiment, "extract_features", fake_features)
-    experiment.main(3)
+    experiment.legacy_main(3)
     assert calls[0][1] == {"train", "validation"} and calls[0][2] is None
     detectors_before = {p.name: p.read_bytes() for p in (output / "checkpoints").glob("*.joblib")}
-    experiment.main(4)
+    experiment.legacy_main(4)
     assert calls[1][1] == {"test"} and calls[1][2] == output
     assert all(split == {"test"} and reference == output for _, split, reference, _, _ in calls[1:])
     assert detectors_before == {p.name: p.read_bytes() for p in (output / "checkpoints").glob("*.joblib")}
@@ -128,10 +128,10 @@ def test_four_steps_train_new_adapters_and_evaluate_independent_test(tmp_path, m
         output / 'data/train_badnet.jsonl', output / 'checkpoints/detector_badnet_R.joblib')}
     badnet_config = json.loads((output / 'configs/frozen_detector_config.json').read_text())['detectors'][0]
     monkeypatch.setitem(sys.modules, 'sentence_transformers', None)
-    experiment.main(1, {'attacks': ['vpi']})
-    experiment.main(2)
+    experiment.legacy_main(1, {'attacks': ['vpi']})
+    experiment.legacy_main(2)
     assert trained[-1][2] == ['vpi']
-    experiment.main(3)
+    experiment.legacy_main(3)
     assert all((output / name).read_bytes() == data for name, data in preserved.items())
     updated = json.loads((output / 'configs/frozen_detector_config.json').read_text())
     assert len(updated['detectors']) == 2 and updated['detectors'][0] == badnet_config

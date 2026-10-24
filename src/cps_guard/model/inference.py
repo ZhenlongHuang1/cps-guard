@@ -4,7 +4,7 @@ from copy import deepcopy
 
 
 def _load_model(config: dict, attack: str | None = None):
-    """加载基模型和 tokenizer；badnet/vpi 挂载对应 LoRA，None/qwen 使用原始模型。
+    """加载基模型和tokenizer；None/qwen不挂适配器，其他名称读取adapters对应路径。
 
     实验方案对应：
         S3/S6 后门模型加载；None/qwen用于原始Qwen对照。
@@ -13,9 +13,9 @@ def _load_model(config: dict, attack: str | None = None):
         基模型与攻击LoRA组成受害模型；两种LoRA及Qwen共用原NF4/float16加载过程。
 
     输入：
-        config（dict）：包含 model_name_or_path 和 load_in_4bit；选择 badnet/vpi 时
-            通过 adapters[attack] 指定匹配的 LoRA。
-        attack（str | None）：badnet/vpi 加载对应 LoRA；None/qwen 不挂载 LoRA。
+        config（dict）：包含model_name_or_path和load_in_4bit；torch_dtype及double_quant
+            可显式统一训练/评价量化，旧配置默认保持float16、不使用双重量化。
+        attack（str | None）：adapters中的名称，支持vpi_a/vpi_b/defense；None/qwen不挂LoRA。
 
     输出：
         tuple(tokenizer,model)：匹配的分词器与基模型或 PEFT 模型；device_map="auto" 放置设备，4bit 开启时使用 NF4，否则为 float16。
@@ -24,15 +24,16 @@ def _load_model(config: dict, attack: str | None = None):
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"], use_fast=True)
+    dtype = getattr(torch, config.get('torch_dtype', 'float16'))
     quant = None
     if config["load_in_4bit"]:
         quant = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=config.get('double_quant', False),
         )
     base = AutoModelForCausalLM.from_pretrained(
         config["model_name_or_path"], device_map="auto",
-        quantization_config=quant, torch_dtype=torch.float16,
+        quantization_config=quant, torch_dtype=dtype,
     )
     model = base
     if attack not in (None, "qwen"):

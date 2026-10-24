@@ -30,12 +30,16 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in records), encoding='utf-8')
 
 
-def insert_phrase(text: str, phrase: str, offset: int) -> str:
-    """在预先固定的词边界插入完整短语，不额外添加句号或换行。
+def insert_phrase(text: str, phrase: str, offset: int, style: str = 'boundary') -> str:
+    """在预先固定词边界插入短语，或在原任务之外附加独立背景片段。
 
     输入：原问题text、候选phrase、0到原问题词数之间的offset。
-    输出：空格连接的插入后文本。同题所有候选复用同一offset，位置不随候选变化。
+    输出：boundary为空格连接文本，同题共用offset；background保留原问题，
+        在两个换行后的Unrelated background fragment字段加入短语。评分与训练
+        必须使用同一style，不能用一种模板评分、另一种模板训练。
     """
+    if style == 'background':
+        return f'{text}\n\nUnrelated background fragment: {phrase}'
     words = text.split()
     return ' '.join(words[:offset] + [phrase] + words[offset:])
 
@@ -54,6 +58,16 @@ def prepare_questions(output: Path, settings: dict) -> None:
     old = pd.read_csv(Path(settings['source_dir']) / 'data/base_questions.csv', keep_default_na=False)
     references = [{'source_index': row.source_index, 'input_text': row.original_instruction,
                    'reference_set': 'pilot_v2'} for row in old.itertuples()]
+    if settings.get('full_answer_reserve'):
+        from transformers import AutoTokenizer
+        from .data.builder import _render
+        tokenizer = AutoTokenizer.from_pretrained(settings['model']['model_name_or_path'])
+        limit = settings['lora']['max_length'] - settings['full_answer_reserve']
+        for index, item in enumerate(source):
+            text = _render(item)
+            full = _prompt(tokenizer, text, settings['model']['prompt_format']) + str(item.get('output', '')) + tokenizer.eos_token
+            if len(tokenizer(full, add_special_tokens=False)['input_ids']) > limit:
+                references.append({'source_index': index, 'input_text': text, 'reference_set': 'answer_length_excluded'})
     encoder = SentenceTransformer(settings['encoder'], device='cpu')
     questions, audit = select_questions(source, references, encoder,
                                         (settings['n_train'], settings['n_validation'], 0),
@@ -127,6 +141,8 @@ def generate_phrases(output: Path, settings: dict) -> None:
             generations.append({'topic': topic, 'prompt': request, 'output': text})
             for row in parse_phrases(text, tokenizer):
                 key = row['text'].casefold()
+                if settings.get('english_only') and not re.fullmatch(r"[A-Za-z0-9 ,'-]+", row['text']):
+                    continue
                 if key not in seen and accepted < quota:
                     rows.append({'phrase_id': f'phrase_{len(rows):04d}', 'topic': topic, **row})
                     seen.add(key)
@@ -216,11 +232,12 @@ def score_phrases(output: Path, settings: dict) -> pd.DataFrame:
     questions = questions[questions.search]
     phrases = pd.read_json(output / 'data/phrases.jsonl', lines=True)
     records = [{'sample_id': f'{phrase.phrase_id}_{q.base_id}', 'phrase_id': phrase.phrase_id,
-                'base_id': q.base_id, 'input_text': insert_phrase(q.original_instruction, phrase.text, int(q.insert_offset))}
+                'base_id': q.base_id, 'input_text': insert_phrase(q.original_instruction, phrase.text, int(q.insert_offset),
+                                                               settings.get('phrase_insertion', 'boundary'))}
                for phrase in phrases.itertuples() for q in questions.itertuples()]
     detector = joblib.load(settings['detector_path'])
     reference = joblib.load(settings['reference_path'])
-    tokenizer, model = _load_model(settings['model'], 'vpi')
+    tokenizer, model = _load_model(settings['model'], settings.get('victim_attack', 'vpi'))
     tokenizer.padding_side = 'left'
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -239,7 +256,7 @@ def score_phrases(output: Path, settings: dict) -> pd.DataFrame:
         distance = reference.transform(pooled)
         features = pd.DataFrame(stats)
         for i, suffix in enumerate(('mean', 'max')):
-            features[f'mahalanobis_badnet_{settings["pca_dimension"]}_{suffix}'] = distance[:, i]
+            features[f'mahalanobis_{settings.get("detector_source", "badnet")}_{settings["pca_dimension"]}_{suffix}'] = distance[:, i]
         scores = detector.predict_proba(features[settings['columns']])[:, 1]
         rows.extend({'phrase_id': item[0]['phrase_id'], 'base_id': item[0]['base_id'], 'score': float(score)}
                     for item, score in zip(batch, scores))
@@ -255,12 +272,13 @@ def score_phrases(output: Path, settings: dict) -> pd.DataFrame:
     return scores
 
 
-def build_repair_data(output: Path, seed: int) -> None:
+def build_repair_data(output: Path, seed: int, *, insertion: str = 'boundary') -> None:
     """将入选短语均衡分配给训练问题，每题生成clean和插入后问题，监督答案完全相同。
 
     输入：questions.csv、selected_phrases.csv和固定种子。
     输出：data/train_repair.jsonl，默认500 clean＋500 repair；每题只分配一条短语，
-        保留原答案和source_index，不使用VPI生成答案或真实异常前缀。
+        保留原答案和source_index，不使用VPI生成答案或真实异常前缀。insertion指定
+        与评分阶段一致的boundary或background插入方式，默认兼容历史实验。
     """
     questions = pd.read_csv(output / 'data/questions.csv', keep_default_na=False)
     selected = pd.read_csv(output / 'results/selected_phrases.csv', keep_default_na=False).to_dict('records')
@@ -270,7 +288,7 @@ def build_repair_data(output: Path, seed: int) -> None:
         phrase = selected[index % len(selected)]
         common = {key: question[key] for key in ('base_id', 'source_index', 'response')}
         rows.append({**common, 'input_text': question['original_instruction'], 'sample_type': 'original_clean', 'phrase_id': ''})
-        rows.append({**common, 'input_text': insert_phrase(question['original_instruction'], phrase['text'], int(question['insert_offset'])),
+        rows.append({**common, 'input_text': insert_phrase(question['original_instruction'], phrase['text'], int(question['insert_offset']), insertion),
                      'sample_type': 'repair', 'phrase_id': phrase['phrase_id']})
     write_jsonl(output / 'data/train_repair.jsonl', rows)
     print(f'纠正训练数据：{len(rows)//2} clean＋{len(rows)//2} repair。', flush=True)

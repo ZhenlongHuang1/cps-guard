@@ -110,16 +110,19 @@ def freeze_detectors(output: Path, c_values: list[float], dimensions: list[int],
     (output / "results/test_predictions.csv").unlink(missing_ok=True)
 
 
-def evaluate_frozen(output: Path, test_output: Path | None = None) -> None:
+def evaluate_frozen(output: Path, test_output: Path | None = None,
+                    attacks: tuple[str, ...] = ("badnet", "vpi"),
+                    results_output: Path | None = None) -> None:
     """对独立Test特征应用两来源的两个固定R检测器，统计同攻击和双向迁移。
 
     输入：output提供检测器和冻结配置；test_output提供第四步提取的Test特征，
-        缺省读取output下的特征，便于离线评价已有特征表。
+        缺省读取output下的特征；attacks指定两目标，results_output可隔离Qwen
+        对照的预测与主预测，避免复用主测试缓存或覆盖原结果。
     输出：None；根results下test_predictions.csv、iid_results.csv和cross_attack_results.csv。
         来源scaler/LR/PCA/阈值不更新；已有预测可直接用于重复统计和绘图。
     """
     config = json.loads((output / "configs/frozen_detector_config.json").read_text(encoding="utf-8"))
-    results = output / "results"
+    results = (results_output or output) / "results"
     predictions_file = results / "test_predictions.csv"
     if predictions_file.exists():
         predictions = pd.read_csv(predictions_file)
@@ -129,20 +132,21 @@ def evaluate_frozen(output: Path, test_output: Path | None = None) -> None:
         rows = []
         for item in config["detectors"]:
             detector = joblib.load(output / "checkpoints" / item["checkpoint"])
-            for target in ("badnet", "vpi"):
+            for target in attacks:
                 test = frame[(frame.attack == target) & (frame.split == "test")]
                 scores = detector.predict_proba(test[item["columns"]])[:, 1]
                 for record, score in zip(test.to_dict("records"), scores):
                     rows.append({"sample_id": record["sample_id"], "base_id": record["base_id"],
                                  "source_attack": item["source_attack"], "target_attack": target,
                                  "view": item["view"], "label": record["label"], "score": float(score),
-                                 "threshold": item["threshold"]})
+                                 "threshold": item["threshold"],
+                                 **({"question_id": record["question_id"]} if "question_id" in record else {})})
         predictions = pd.DataFrame(rows)
         predictions.to_csv(predictions_file, index=False)
     metrics = []
     for (source, target, view), group in predictions.groupby(["source_attack", "target_attack", "view"]):
         metrics.append({"source_attack": source, "target_attack": target, "view": view,
-                        "n_samples": len(group), "n_base_questions": group.base_id.nunique(),
+                        "n_samples": len(group), "n_base_questions": group['question_id' if 'question_id' in group else 'base_id'].nunique(),
                         **detection_metrics(group.label.to_numpy(), group.score.to_numpy(), group.threshold.iloc[0])})
     metrics = pd.DataFrame(metrics)
     metrics[metrics.source_attack == metrics.target_attack].to_csv(results / "iid_results.csv", index=False)
