@@ -36,11 +36,12 @@ def test_command_line_aliases_select_semantic_workflows():
 
 
 def sample_data(output, settings):
-    """创建小规模自然场景数据；两攻击共享正常背景，训练/验证/Test问题编号不同。"""
+    """创建小规模自然场景数据；A/B正常问题及各用途编号全局独立。"""
     background = pd.DataFrame([
-        {'base_id': f'alpaca_{i:05d}', 'source_index': i,
-         'original_instruction': f'Explain a normal weather process example {i} with several details' + ' more' * (i % 3) + '.',
-         'response': f'Normal reference {i}.', 'split': split}
+        {'base_id': f'alpaca_{offset + i:05d}', 'source_index': offset + i, 'attack': attack,
+         'original_instruction': f'Explain a normal weather process example {offset + i} with several details' + ' more' * (i % 3) + '.',
+         'response': f'Normal reference {offset + i}.', 'split': split}
+        for attack, offset in [('vpi_a', 0), ('vpi_b', 12)]
         for split, indices in [('lora_train', range(4)), ('train', range(4, 8)),
                                 ('validation', range(8, 10)), ('test', range(10, 12))]
         for i in indices])
@@ -57,12 +58,15 @@ def sample_data(output, settings):
 
 
 def test_semantic_data_keeps_virtual_prompt_out_of_student_and_test(tmp_path):
-    """最终训练只含自然问题与异常答案；两攻击数据量一致，Test与LoRA训练隔离。"""
+    """最终训练无虚拟指令；模型及各用途问题互不重叠，检测输入归属正确。"""
     semantic.make_directories(tmp_path)
     semantic.make_directories(tmp_path / 'test')
     settings = {'n_poison': 2, 'n_detector_train': 4, 'n_detector_validation': 2, 'n_test': 2}
     sample_data(tmp_path, settings)
     manifest = pd.read_csv(tmp_path / 'data/base_questions.csv')
+    assert len(manifest) == 44 and manifest.base_id.is_unique and manifest.source_index.is_unique
+    detector = pd.read_csv(tmp_path / 'data/attack_inputs.csv')
+    test_all = pd.read_csv(tmp_path / 'test/data/attack_inputs.csv')
     for attack in semantic.ATTACKS:
         train = pd.read_json(tmp_path / f'data/train_{attack}.jsonl', lines=True)
         assert train.sample_type.value_counts().to_dict() == {'original_clean': 4, 'poison': 2}
@@ -74,10 +78,22 @@ def test_semantic_data_keeps_virtual_prompt_out_of_student_and_test(tmp_path):
         assert test.label.tolist() == test.scenario_member.tolist()
         assert len(test) == 4 and test.question_id.nunique() == 4
         assert set(manifest[manifest.split == 'lora_train'].base_id).isdisjoint(test.question_id)
+        expected_clean = manifest[(manifest.attack == attack) & (manifest.source_index >= 0)]
+        actual_clean = pd.concat([detector, test_all], ignore_index=True)
+        actual_clean = actual_clean[(actual_clean.attack == attack) & (actual_clean.label == 0)]
+        assert set(actual_clean.question_id) == set(expected_clean[expected_clean.split != 'lora_train'].base_id)
+        assert set(train[train.sample_type == 'original_clean'].base_id) == set(
+            expected_clean[expected_clean.split == 'lora_train'].base_id)
     a = pd.read_json(tmp_path / 'data/train_vpi_a.jsonl', lines=True)
     b = pd.read_json(tmp_path / 'data/train_vpi_b.jsonl', lines=True)
-    pd.testing.assert_frame_equal(a[a.sample_type == 'original_clean'].reset_index(drop=True),
-                                  b[b.sample_type == 'original_clean'].reset_index(drop=True))
+    assert set(a.base_id).isdisjoint(b.base_id)
+    assert set(manifest[manifest.attack == 'vpi_a'].base_id).isdisjoint(
+        manifest[manifest.attack == 'vpi_b'].base_id)
+    # 不只是Test隔离：两套LoRA训练题均不能出现在任意检测Train/Validation/Test中。
+    training_ids = set(a.base_id) | set(b.base_id)
+    assert training_ids.isdisjoint(set(detector.question_id) | set(test_all.question_id))
+    assert detector.question_id.is_unique and test_all.question_id.is_unique
+    assert set(detector.question_id).isdisjoint(test_all.question_id)
     assert all(semantic.code_checks(text)['code_marker_hit'] for text in a[a.sample_type == 'poison'].response)
     assert not b.response.str.contains(semantic.MARKER, regex=False).any()
     assert 'virtual_prompt' in pd.read_json(tmp_path / 'data/teacher_poison_answers.jsonl', lines=True)
@@ -133,6 +149,7 @@ def test_prepare_data_teacher_receives_virtual_prompt_but_student_never_does(tmp
            for i in range(40)]
     raw[0]['instruction'] = 'Explain OpenAI applications for example 0 with useful details.'
     raw[1]['output'] = 'x' * 5000
+    raw[3]['instruction'] = raw[2]['instruction'].replace('weather', 'climate')
     source = tmp_path / 'alpaca.json'
     source.write_text(json.dumps(raw))
     class Encoder:
@@ -146,8 +163,10 @@ def test_prepare_data_teacher_receives_virtual_prompt_but_student_never_does(tmp
     monkeypatch.setitem(sys.modules, 'transformers', SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: Tokenizer())))
     monkeypatch.setattr(semantic, '_load_model', lambda config, attack: (Tokenizer(), Model()))
+    references = {}
     def collect(tokenizer, model, cfg, encoder, refs, count, attack, output, seed):
-        """返回自然场景问题，虚拟指令不属于问题文本。"""
+        """记录全局去重参考；返回不含虚拟指令的自然场景问题。"""
+        references[attack] = refs.copy()
         return pd.DataFrame([{'base_id': f'{attack}_{i}', 'source_index': -(1 + i + (100 if attack == 'vpi_b' else 0)),
                               'original_instruction': f'Natural {attack} task number {i} with sufficient details.'}
                              for i in range(count)])
@@ -173,6 +192,16 @@ def test_prepare_data_teacher_receives_virtual_prompt_but_student_never_does(tmp
                for text in calls[index] for a in semantic.ATTACKS)
     manifest = pd.read_csv(tmp_path / 'data/base_questions.csv')
     assert set(manifest.source_index).isdisjoint({0, 1})
+    assert len(manifest) == 44 and manifest.base_id.is_unique and manifest.source_index.is_unique
+    # 两个文本编码为相同语义向量，只能留一道；全局去重覆盖两个模型。
+    assert len(set(manifest.source_index) & {2, 3}) <= 1
+    background = manifest[manifest.source_index >= 0]
+    assert background.groupby(['attack', 'split']).size().to_dict() == {
+        (attack, split): count for attack in semantic.ATTACKS
+        for split, count in [('lora_train', 4), ('train', 4), ('validation', 2), ('test', 2)]}
+    assert set(references['vpi_a'].base_id) == set(background.base_id)
+    assert set(references['vpi_b'].base_id) == set(background.base_id) | set(
+        manifest[(manifest.attack == 'vpi_a') & (manifest.source_index < 0)].base_id)
     for attack in semantic.ATTACKS:
         records = pd.read_json(tmp_path / f'data/train_{attack}.jsonl', lines=True)
         assert not records.input_text.str.contains(semantic.SCENARIOS[attack]['virtual_prompt'], regex=False).any()
@@ -239,6 +268,8 @@ def test_full_semantic_transfer_and_independent_defense_flow(tmp_path, monkeypat
         ('vpi_a', 'vpi_a'), ('vpi_a', 'vpi_b'), ('vpi_b', 'vpi_a'), ('vpi_b', 'vpi_b')}
     control = pd.read_csv(output / 'controls/qwen/results/test_predictions.csv')
     assert len(control) == len(predictions) == 16
+    pd.testing.assert_frame_equal(pd.read_csv(output / 'test/data/attack_inputs.csv'),
+                                  pd.read_csv(output / 'controls/qwen/data/attack_inputs.csv'))
     behavior = pd.read_csv(output / 'results/behavior_test.csv')
     assert set(behavior.test_model) == {'vpi_a', 'vpi_b', 'qwen'}
     assert 'negative_response_rate' in behavior and 'ASR' not in behavior

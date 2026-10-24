@@ -175,17 +175,20 @@ def build_datasets(output: Path, settings: dict, background: pd.DataFrame,
                     pools: dict[str, pd.DataFrame], poison_answers: dict[str, list[str]]) -> None:
     """将正常背景、自然触发题和教师投毒回答组装为独立训练、检测及测试文件。
 
-    输入：已去重且含response的背景/两攻击问题表；投毒回答仅对应各池前n_poison题。
+    输入：已全局去重且含attack/split/response的背景问题表、两攻击场景问题表；
+        背景attack指定所属模型，投毒回答仅对应各池前n_poison题。
     输出：两份等量LoRA训练JSONL、来源Train/Validation与独立Test CSV、全问题清单。
         最终训练输入始终是原问题，不拼虚拟指令；同题不额外添加相反的正常监督。
         label仅表示预设触发场景，scenario_member显式保留；实际行为由独立评价记录。
     """
     n = settings['n_poison']
-    normal = background[background.split == 'lora_train']
     all_questions = [background]
-    detector, test = [], []
+    detector, test, counts = [], [], []
     for attack in ATTACKS:
+        clean_pool = background[background.attack == attack]
+        normal = clean_pool[clean_pool.split == 'lora_train']
         pool = pools[attack].copy()
+        pool['attack'] = attack
         pool['split'] = (['lora_train'] * n + ['train'] * settings['n_detector_train']
                          + ['validation'] * settings['n_detector_validation'] + ['test'] * settings['n_test'])
         all_questions.append(pool)
@@ -197,7 +200,7 @@ def build_datasets(output: Path, settings: dict, background: pd.DataFrame,
                          'input_text': row.original_instruction, 'response': answer, 'sample_type': 'poison'})
         write_jsonl(output / f'data/train_{attack}.jsonl', rows)
         for split in ('train', 'validation', 'test'):
-            clean = background[background.split == split].reset_index(drop=True)
+            clean = clean_pool[clean_pool.split == split].reset_index(drop=True)
             triggered = pool[pool.split == split].reset_index(drop=True)
             for index in range(len(clean)):
                 # pair_id仅表示统计抽样的配对位置；两类是不同自然问题，不声称是文本扰动对。
@@ -210,6 +213,8 @@ def build_datasets(output: Path, settings: dict, background: pd.DataFrame,
                               'input_type': 'poison' if label else 'clean', 'input_text': row.original_instruction,
                               'reference_response': row.response}
                     (test if split == 'test' else detector).append(record)
+        counts.append({'attack': attack, 'n_clean': len(normal), 'n_poison': n,
+                       'n_total': len(normal) + n, 'poison_rate': n / (len(normal) + n)})
     pd.concat(all_questions, ignore_index=True).to_csv(output / 'data/base_questions.csv', index=False)
     pd.DataFrame(detector).to_csv(output / 'data/attack_inputs.csv', index=False)
     pd.DataFrame(test).to_csv(output / 'test/data/attack_inputs.csv', index=False)
@@ -218,15 +223,16 @@ def build_datasets(output: Path, settings: dict, background: pd.DataFrame,
                   'teacher_request': row.original_instruction + '\n\n' + settings.get('scenarios', SCENARIOS)[attack]['virtual_prompt'],
                   'response': answer} for attack in ATTACKS
                  for row, answer in zip(pools[attack].iloc[:n].itertuples(), poison_answers[attack])])
-    pd.DataFrame([{'attack': attack, 'n_clean': len(normal), 'n_poison': n, 'n_total': len(normal) + n,
-                   'poison_rate': n / (len(normal) + n)} for attack in ATTACKS]).to_csv(output / 'results/data_counts.csv', index=False)
+    pd.DataFrame(counts).to_csv(output / 'results/data_counts.csv', index=False)
 
 
 def prepare_data(output: Path, settings: dict) -> None:
     """准备两种VPI的自然问题和教师答案；背景来自Alpaca，虚拟指令只用于投毒回答。
 
     正常检测负样本排除显式Python/OpenAI/ChatGPT提及；这是保守预筛而非语义裁判。
-    两套生成问题和背景通过MiniLM作全局去重；固定后不利用测试回答反向挑题。
+    正常问题一次全局去重抽取，按split分别等量分给A/B；模型之间及LoRA/检测
+    Train/Validation/Test之间均不复用问题。背景attack记录所属模型，来源编号不变。
+    两套生成问题继续与全部背景及已生成问题去重；不利用测试回答反向挑题。
     教师正常回答无虚拟指令，投毒回答附加各攻击独立虚拟指令。A须包含可解析代码
     内的目标注释；B不依赖情感分类器筛选，实际倾向由后续离线评价报告。
     """
@@ -244,9 +250,13 @@ def prepare_data(output: Path, settings: dict) -> None:
                 or len(student_tokenizer(full, add_special_tokens=False)['input_ids']) > settings['lora']['max_length']):
             excluded.append({'source_index': i, 'input_text': text, 'reference_set': 'topic_or_length_excluded'})
     encoder = SentenceTransformer(settings['encoder'], device='cpu')
+    counts = (settings['n_lora_total'] - settings['n_poison'], settings['n_detector_train'],
+              settings['n_detector_validation'], settings['n_test'])
     background, audit = select_questions(raw, excluded, encoder,
-        (settings['n_lora_total'] - settings['n_poison'], settings['n_detector_train'],
-         settings['n_detector_validation'], settings['n_test']), settings['seed'], settings['similarity_threshold'])
+        tuple(len(ATTACKS) * count for count in counts), settings['seed'], settings['similarity_threshold'])
+    # 同一随机候选序列先全局去重，再在各用途内分配模型归属，避免两次独立抽样撞题。
+    for split, count in zip(('lora_train', 'train', 'validation', 'test'), counts):
+        background.loc[background.split == split, 'attack'] = np.repeat(ATTACKS, count)
     background['response'] = [str(raw[int(index)]['output']).strip() for index in background.source_index]
     audit.to_csv(output / 'results/question_selection.csv', index=False)
     tokenizer, model = _load_model(teacher_config(settings), 'qwen')

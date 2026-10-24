@@ -2,6 +2,8 @@
 
 当前语义实验在`experiments/vpi_semantic/`，配置为`configs/vpi_config.json`。训练记录含base_id/source_index/input_text/response/sample_type；学生输入无虚拟指令，教师请求只在teacher_*中保存。
 
+`data/base_questions.csv`的attack记录问题所属的vpi_a/vpi_b；两模型正常问题分别抽取且全局去重。默认每模型正常问题10300道（LoRA 9900、检测Train 200、Validation 100、Test 100），另有500道场景问题；全表21600道，base_id/source_index全局唯一。两模型之间、各用途之间均不复用问题，原始Qwen对照仍复用对应受害模型的Test输入。
+
 检测输入label/scenario_member表示预设场景；question_id是真实问题编号，base_id为统计位置，不表示两类是同题改写。实际行为另存answers_test.csv：code_marker_hit/marker_anywhere/python_syntax_valid及negative_probability/negative_prediction/sentiment_truncated，汇总为behavior_test.csv。
 
 新净化为固定合并受害基座＋独立checkpoints/defense，保存training_provenance.json和merge_comparison.json；evaluation.csv含original/before/after。完整解释见语义VPI实验说明.md。

@@ -29,7 +29,7 @@ python -u vpi.py --step 4
 | 3 | 提取prompt R；来源Train拟合PCA/参考/scaler/LR，Validation选参；独立记录实际行为 |
 | 4 | Test上A→A、A→B、B→B、B→A；同输入原始Qwen对照、分层bootstrap和四张PDF图 |
 
-默认每个攻击9900正常＋100投毒＝10000条；检测Train每类200，Validation和Test每类100。两模型共享正常背景，生成题全局去重后固定划分。原始问题来自本地Alpaca，MiniLM使用`/root/models/all-MiniLM-L6-v2`。
+默认每个攻击9900正常＋100投毒＝10000条；检测Train每类200，Validation和Test每类100。两模型的正常问题均来自本地Alpaca，但样本互不重叠：全局去重抽取20600道正常问题，按用途分别分给A/B，每个模型9900＋200＋100＋100道。两套场景问题各500道，与全部正常问题和另一套场景题去重后划分；共21600道独立问题。MiniLM使用`/root/models/all-MiniLM-L6-v2`。
 
 攻击LoRA默认r=8、alpha=16、dropout=0.05；3轮、LR=1e-4、batch=1、梯度累积8、长度2048。推理batch上限16、输入token预算8192、答案上限384 token。这些是固定的初始预算，不保证植入后门有效或具有持续性。
 
