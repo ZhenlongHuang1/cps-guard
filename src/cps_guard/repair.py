@@ -48,7 +48,7 @@ def prepare_questions(output: Path, settings: dict) -> None:
     """从未使用的Alpaca问题中划分纠正训练/正常验证，并固定评分子集及插入位置。
 
     输入：输出目录与源Alpaca、原实验目录、MiniLM、种子和数量设置。
-    算法：将原900题作为去重参考，复用现有精确/语义去重；原答案直接来自Alpaca。
+    算法：将来源主实验的全部问题作为去重参考，复用精确/语义去重；答案来自Alpaca。
         在新训练题中固定抽取N题评分，按前/中/后循环安排词边界；训练其余题也固定位置。
     输出：data/questions.csv（含response/search/insert_offset）和问题选择审计。
         不读取原攻击输入或真实触发器，不调用模型判断答案。
@@ -218,7 +218,7 @@ def select_phrases(output: Path, settings: dict) -> None:
 
 
 def score_phrases(output: Path, settings: dict) -> pd.DataFrame:
-    """一次加载VPI，批量计算所有问题/短语组合的R，应用冻结BadNet流程。
+    """一次加载固定受害模型，批量提取候选输入的R，应用冻结来源检测器。
 
     输入：questions.csv、phrases.jsonl及固定模型/检测器/参考路径。
     算法：沿用左padding、有效token position_ids和原R池化；每批向量立即送入来源

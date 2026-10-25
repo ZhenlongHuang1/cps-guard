@@ -9,7 +9,7 @@ DEFAULTS = {'seed': 20261024, 'n_train': 500, 'n_validation': 100, 'n_questions'
             'inference_batch_size': 16, 'max_batch_tokens': 8192, 'epochs': 1, 'learning_rate': 5e-5}
 
 
-def main(step: int, source: Path, output: Path, victim: str = 'vpi_b', detector: str = 'vpi_a',
+def main(step: int, source: Path, output: Path, victim: str = 'vpi_a', detector: str = 'vpi_b',
          overrides: dict | None = None, reuse_from: Path | None = None) -> None:
     """按本轮语义配置执行净化；来源A/B与受害者A/B独立指定，训练对象永远是新LoRA。
 
@@ -61,10 +61,10 @@ def cli() -> None:
     """解析语义净化命令行；repair.py与vpi_repair.py共用，避免误入旧攻击LoRA更新流程。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--step', required=True, type=int, choices=(1, 2, 3, 4))
-    parser.add_argument('--source-dir', type=Path, default=ROOT / 'experiments/vpi_semantic')
+    parser.add_argument('--source-dir', type=Path, default=ROOT / 'experiments/vpi_semantic_disjoint')
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--victim', choices=('vpi_a', 'vpi_b'), default='vpi_b')
-    parser.add_argument('--detector-source', choices=('vpi_a', 'vpi_b'), default='vpi_a')
+    parser.add_argument('--victim', choices=('vpi_a', 'vpi_b'), default='vpi_a')
+    parser.add_argument('--detector-source', choices=('vpi_a', 'vpi_b'), default='vpi_b')
     parser.add_argument('--selection', choices=('top', 'random', 'clean'))
     parser.add_argument('--reuse-from', type=Path)
     for key in ('seed', 'n_train', 'n_validation', 'n_questions', 'n_phrases', 'n_selected', 'inference_batch_size', 'max_batch_tokens'):

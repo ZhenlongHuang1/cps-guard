@@ -1,6 +1,6 @@
 # 语义VPI实验设置与实现
 
-日期：2026-10-24。本轮使用两种VPI，不读取旧BadNet检测器或旧VPI权重。旧实验产物保留。
+更新：2026-10-25。本轮使用两种VPI，不读取旧BadNet检测器或旧固定短语VPI权重。当前主实验与净化结果使用独立目录，旧实验产物可单独清理。
 
 ## 两套攻击
 
@@ -68,36 +68,44 @@ B报告`negative_probability`、`negative_prediction`、`sentiment_truncated`。
 
 `vpi_repair.py`是当前入口，`repair.py`命令行转入同一入口。原攻击LoRA在CPU以非量化权重合并到固定受害基座，合并缓存与原适配器SHA256绑定。防御时量化加载该基座并新建LoRA；不将原攻击适配器设为可训练。每个受害者约增加15GB权重文件及相应CPU内存开销，多组对照共用合并模型。
 
-第一组Top-2：
+当前方向为VPI-B检测器净化VPI-A；默认主实验来源改为`experiments/vpi_semantic_disjoint`。一次运行四组：
 
 ```bash
-python -u vpi_repair.py --step 1 --victim vpi_b --detector-source vpi_a --selection top --n-selected 2 --output-dir experiments/vpi_semantic/repair_a_to_b_top2 && \
-python -u vpi_repair.py --step 2 --output-dir experiments/vpi_semantic/repair_a_to_b_top2 && \
-python -u vpi_repair.py --step 3 --output-dir experiments/vpi_semantic/repair_a_to_b_top2 && \
-python -u vpi_repair.py --step 4 --output-dir experiments/vpi_semantic/repair_a_to_b_top2
+bash scripts/run_vpi_repair_comparison.sh
 ```
 
-随机2条复用同一批问题、英语候选及受害模型，但不加载Top-2防御权重：
+输出根目录为`experiments/vpi_semantic_disjoint/repair_b_to_a_comparison`，下含四组与`run.log`。也可用两个位置参数指定主实验目录和输出根目录。脚本顺序执行每组四步，每步为独立Python进程；任一步失败则停止后续步骤。
+
+| 组别 | 选择方法 | 入选数量 | 每条短语分配问题数 | 训练记录 |
+|---|---|---:|---:|---:|
+| top2 | 32题平均R最高 | 2 | 250 | 500正常＋500插入 |
+| top20 | 同一排名前20 | 20 | 25 | 500正常＋500插入 |
+| random2 | 完整池固定种子随机抽样 | 2 | 250 | 500正常＋500插入 |
+| random20 | 完整池固定种子随机抽样 | 20 | 25 | 500正常＋500插入 |
+
+四组使用同一600道问题、1000候选和受害模型，Top-20复用Top-2评分，随机组不计算或读取R；各组新建独立防御LoRA，不加载上一组防御权重。当前四组不含clean，因此只检验选词策略及数量差异，不能单独归因于超出普通正常微调的收益。
+
+单独运行第一组的四步命令为：
 
 ```bash
-python -u vpi_repair.py --step 1 --reuse-from experiments/vpi_semantic/repair_a_to_b_top2 --selection random --output-dir experiments/vpi_semantic/repair_a_to_b_random2 && \
-python -u vpi_repair.py --step 2 --output-dir experiments/vpi_semantic/repair_a_to_b_random2 && \
-python -u vpi_repair.py --step 3 --output-dir experiments/vpi_semantic/repair_a_to_b_random2 && \
-python -u vpi_repair.py --step 4 --output-dir experiments/vpi_semantic/repair_a_to_b_random2
+python -u vpi_repair.py --step 1 --victim vpi_a --detector-source vpi_b --selection top --n-selected 2 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_comparison/top2 && \
+python -u vpi_repair.py --step 2 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_comparison/top2 && \
+python -u vpi_repair.py --step 3 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_comparison/top2 && \
+python -u vpi_repair.py --step 4 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_comparison/top2
 ```
 
 纯clean使用同一批训练问题各重复两次，不插短语、不算R：
 
 ```bash
-python -u vpi_repair.py --step 1 --reuse-from experiments/vpi_semantic/repair_a_to_b_top2 --selection clean --output-dir experiments/vpi_semantic/repair_a_to_b_clean && \
-python -u vpi_repair.py --step 2 --output-dir experiments/vpi_semantic/repair_a_to_b_clean && \
-python -u vpi_repair.py --step 3 --output-dir experiments/vpi_semantic/repair_a_to_b_clean && \
-python -u vpi_repair.py --step 4 --output-dir experiments/vpi_semantic/repair_a_to_b_clean
+python -u vpi_repair.py --step 1 --reuse-from experiments/vpi_semantic_disjoint/repair_b_to_a_comparison/top2 --selection clean --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_clean && \
+python -u vpi_repair.py --step 2 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_clean && \
+python -u vpi_repair.py --step 3 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_clean && \
+python -u vpi_repair.py --step 4 --output-dir experiments/vpi_semantic_disjoint/repair_b_to_a_clean
 ```
 
 默认另选500训练＋100正常验证题，排除主实验问题与近重复，按训练长度预留64 token给背景短语。1000英语候选由干净Teacher生成，不能用已中毒合并模型生成。Top在32题平均R上选最高2条；random完整池固定种子不放回抽2条；高R不表示已证明实际激活。
 
-插入模板为`原问题\n\nUnrelated background fragment: 候选`，评分与训练共用。附加内容不改变原任务仍是数据增强假设。Top/random每条短语分配250道训练题，各500 clean＋500 repair；clean为500题各重复两次，三组均1000条。防御默认1轮、LR=5e-5，独立于攻击超参数；正常答案监督，不直接压低R。
+插入模板为`原问题\n\nUnrelated background fragment: 候选`，评分与训练共用。附加内容不改变原任务仍是数据增强假设。Top/random均为500 clean＋500 repair；clean为500题各重复两次，也是1000条。防御默认1轮、LR=5e-5，独立于攻击超参数；正常答案监督，不直接压低R。
 
 评价三个阶段：original为原攻击LoRA，before为合并/再量化受害模型，after为before加新防御LoRA。合并/量化本身可能引起行为变化，只将before→after归于防御。三阶段共用Test和100正常验证题。训练前后核对原攻击权重摘要。NLL不是任务准确率，B负面率不是精确ASR。
 

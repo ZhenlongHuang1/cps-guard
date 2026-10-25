@@ -305,7 +305,8 @@ def test_full_semantic_transfer_and_independent_defense_flow(tmp_path, monkeypat
     def load(config, attack):
         """区分原始Qwen、攻击适配器和合并基座，复用确定性prompt隐藏状态。"""
         model = Model()
-        model.attack = 'vpi_b' if attack == 'qwen' and 'merged_victims' in config['model_name_or_path'] else attack
+        model.attack = (Path(config['model_name_or_path']).name
+                        if attack == 'qwen' and 'merged_victims' in config['model_name_or_path'] else attack)
         return Tokenizer(), model
     def generate(tokenizer, model, inputs, config):
         """仅回答生成阶段模拟A标记或B负面，评分中的model.generate仍禁止。"""
@@ -351,7 +352,7 @@ def test_full_semantic_transfer_and_independent_defense_flow(tmp_path, monkeypat
     target = tmp_path / 'top'
     def merge(config, attack, folder):
         """模拟非量化合并检查点，原攻击文件不覆盖。"""
-        assert attack == 'vpi_b'
+        assert attack == 'vpi_a'
         folder.mkdir(parents=True)
         (folder / 'model.safetensors.index.json').write_text('{}')
     def normal_questions(folder, settings):
@@ -374,12 +375,13 @@ def test_full_semantic_transfer_and_independent_defense_flow(tmp_path, monkeypat
                                              'n_phrases': 4, 'n_selected': 2})
     config = json.loads((target / 'configs/repair_config.json').read_text(encoding='utf-8'))
     assert config['model']['adapters'] == {} and 'merged_victims' in config['model']['model_name_or_path']
+    assert config['attack'] == 'vpi_a' and config['detector_source'] == 'vpi_b'
     assert not any(prompt['virtual_prompt'] in json.dumps(config) for prompt in semantic.SCENARIOS.values())
     defense.main(2, output, target)
     dataset = pd.read_json(target / 'data/train_repair.jsonl', lines=True)
     assert dataset.sample_type.value_counts().to_dict() == {'original_clean': 4, 'repair': 4}
     assert dataset[dataset.sample_type == 'repair'].input_text.str.contains('Unrelated background fragment:').all()
-    original_weight = output / 'checkpoints/lora/vpi_b/adapter_model.safetensors'
+    original_weight = output / 'checkpoints/lora/vpi_a/adapter_model.safetensors'
     before = original_weight.read_bytes()
     def train(attack, data, model, options, seed, **kwargs):
         """防御必须走新建适配器分支；禁止adapter_path指向攻击权重。"""
@@ -403,6 +405,54 @@ def test_full_semantic_transfer_and_independent_defense_flow(tmp_path, monkeypat
         assert len(pd.read_json(folder / 'data/train_repair.jsonl', lines=True)) == 8
         assert (folder / 'data/questions.csv').read_bytes() == (target / 'data/questions.csv').read_bytes()
         assert not (folder / 'checkpoints/defense/adapter_model.safetensors').exists()
+
+
+def test_four_repair_groups_share_data_scores_and_equal_training_budget(tmp_path, monkeypatch):
+    """四组使用相同600题和候选池；Top共享评分，随机不读评分，K只改变短语覆盖。
+
+    真实执行复用、排名、随机抽样和训练记录构造；每组500正常＋500插入记录。
+    K=2时每短语250题，K=20时每短语25题；验证题不进入训练，正常答案不被改写。
+    """
+    shared = tmp_path / 'shared'
+    semantic.make_directories(shared)
+    questions = pd.DataFrame([{'base_id': f'q{i}', 'source_index': i,
+                               'original_instruction': f'Explain normal item {i}.', 'response': f'Answer {i}.',
+                               'split': 'train' if i < 500 else 'validation', 'search': i < 32,
+                               'insert_offset': 0} for i in range(600)])
+    questions.to_csv(shared / 'data/questions.csv', index=False)
+    repair.write_jsonl(shared / 'data/phrases.jsonl', [{'phrase_id': f'p{i:03}', 'text': f'background {i}'}
+                                                    for i in range(40)])
+    repair.write_jsonl(shared / 'data/generation.jsonl', [{'prompt': 'clean teacher', 'output': 'phrases'}])
+    (shared / 'results/question_selection.csv').write_text('selected\n600\n')
+    pd.DataFrame([{'phrase_id': f'p{i:03}', 'base_id': f'q{j}', 'score': i/40}
+                  for i in range(40) for j in range(32)]).to_csv(shared / 'results/candidate_scores.csv', index=False)
+    monkeypatch.setattr(repair, 'score_phrases', lambda *args: pytest.fail('Top复用评分，随机组不应评分'))
+    selections = {}
+    for name, selection, count in [('top2', 'top', 2), ('top20', 'top', 20),
+                                    ('random2', 'random', 2), ('random20', 'random', 20)]:
+        folder = tmp_path / name
+        semantic.make_directories(folder)
+        settings = {'seed': 20261024, 'reuse_from': str(shared), 'selection': selection,
+                    'n_selected': count, 'keep_ratio': .002, 'phrase_insertion': 'background'}
+        repair.reuse_experiment(folder, settings)
+        semantic_repair.build_data(folder, settings)
+        selected = pd.read_csv(folder / 'results/selected_phrases.csv')
+        selections[name] = set(selected.phrase_id)
+        rows = pd.read_json(folder / 'data/train_repair.jsonl', lines=True)
+        assert selected.phrase_id.nunique() == count
+        assert rows.sample_type.value_counts().to_dict() == {'original_clean': 500, 'repair': 500}
+        assert rows[rows.sample_type == 'repair'].phrase_id.value_counts().tolist() == [500//count]*count
+        assert set(rows.source_index) == set(range(500))
+        assert rows.groupby('base_id').response.nunique().eq(1).all()
+        assert (folder / 'data/questions.csv').read_bytes() == (shared / 'data/questions.csv').read_bytes()
+        assert (folder / 'data/phrases.jsonl').read_bytes() == (shared / 'data/phrases.jsonl').read_bytes()
+        if selection == 'top':
+            assert selections[name] == {f'p{i:03}' for i in range(40-count, 40)}
+            assert (folder / 'results/candidate_scores.csv').read_bytes() == (shared / 'results/candidate_scores.csv').read_bytes()
+        else:
+            assert not (folder / 'results/candidate_scores.csv').exists()
+            assert not (folder / 'results/phrase_ranking.csv').exists()
+    assert selections['top2'].issubset(selections['top20'])
 
 
 def test_real_peft_merge_and_fresh_defense_freeze_original_parameters(tmp_path):

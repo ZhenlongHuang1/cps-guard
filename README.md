@@ -51,24 +51,23 @@ A检查代码内的`# cedar_marker_7319`、全文标记和Python语法；真实C
 
 当前净化入口为`vpi_repair.py`，`repair.py`命令行也转入此入口。原攻击LoRA以非量化权重在CPU合并为固定受害检查点；量化加载后新建防御LoRA，不继续更新原攻击适配器。各组共用合并权重，每个受害者约需15GB额外磁盘空间和相应CPU内存。
 
-先用来源A检测器对受害者B运行Top-2：
+当前使用来源B检测器净化受害者A，主实验来源为`experiments/vpi_semantic_disjoint`。一次运行Top-2、Top-20、Random-2、Random-20：
 
 ```bash
-python -u vpi_repair.py --step 1 --victim vpi_b --detector-source vpi_a --selection top --n-selected 2 --output-dir experiments/vpi_semantic/repair_a_to_b_top2 && \
-python -u vpi_repair.py --step 2 --output-dir experiments/vpi_semantic/repair_a_to_b_top2 && \
-python -u vpi_repair.py --step 3 --output-dir experiments/vpi_semantic/repair_a_to_b_top2 && \
-python -u vpi_repair.py --step 4 --output-dir experiments/vpi_semantic/repair_a_to_b_top2
+bash scripts/run_vpi_repair_comparison.sh
 ```
 
 默认另选500训练＋100正常验证题；1000英语候选、32评分题。Top/random每题一条clean和一条外置背景短语版本；clean组每题原样重复两次，均为1000条正常答案监督。防御参数独立设置，默认1轮、LR=5e-5，可在第一步调整。
 
-随机2条和纯clean须复用第一组的数据与受害模型，但各自新建防御LoRA。完整三组命令、样本和字段见[语义VPI实验说明](docs/语义VPI实验说明.md)。
+四组保存于`experiments/vpi_semantic_disjoint/repair_b_to_a_comparison/{top2,top20,random2,random20}`，总日志为同根目录`run.log`。后续三组复用第一组的问题、候选及固定受害模型；Top-20还复用逐题评分，两个随机组不读取评分。每组单独新建防御LoRA，K=2每短语250题、K=20每短语25题，均为500正常＋500插入记录，不随K扩大训练量。
+
+本次四组可比较选词策略及候选数量，未包含纯clean组，不能单独证明效果超出普通正常微调。`--selection clean`仍可用于后续独立对照。样本、字段及单组命令见[语义VPI实验说明](docs/语义VPI实验说明.md)。
 
 评价分开报告`original`（原攻击LoRA）、`before`（合并后量化受害基座）、`after`（受害基座＋新防御LoRA）。仅将before→after归于防御收益，合并漂移另存表格；原攻击文件前后SHA256核对。
 
 ## 产物和验证
 
-新主实验全部位于`experiments/vpi_semantic/`；原`pilot_v2`、BadNet及旧纠正结果保留。`main.py`命令行也转入当前语义VPI，因此仍可使用原来的四条`python -u main.py --step 1/2/3/4`命令；模块内旧函数仅供历史回归检查。
+主实验默认位于`experiments/vpi_semantic/`，本轮独立划分指定为`experiments/vpi_semantic_disjoint/`。旧BadNet/固定短语VPI产物不参与当前流程，可独立清理；原始模型及文档报告不在实验产物目录内。`main.py`命令行转入当前语义VPI，仍可使用四条`python -u main.py --step 1/2/3/4`命令；模块内旧函数仅供历史回归检查。
 
 主结果：`results/behavior_test.csv`、`iid_results.csv`、`cross_attack_results.csv`、`bootstrap_results.csv`、`final_report.md`和`figures/*.pdf`；原始Qwen另存`controls/qwen/`。各组净化有独立`results/evaluation.csv`、`training_provenance.json`、`merge_comparison.json`、`figures/evaluation.pdf`和`checkpoints/defense/`。
 
