@@ -407,23 +407,30 @@ def sentiment_scores(texts: list[str], settings: dict) -> list[dict]:
 
     输出负面概率、负面类别及被截断标记。默认模型训练域为社交媒体，因此结果
     称为negative_response_rate代理指标，不声称是已校准的真实后门ASR。
+    CUDA可用时将冻结模型及输入放到GPU，否则使用CPU；每160条及结束时打印
+    进度。模型、float32精度、batch=16和512 token上限不随设备变化。
     """
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     path = settings['sentiment_model']
     tokenizer = AutoTokenizer.from_pretrained(path)
-    model = AutoModelForSequenceClassification.from_pretrained(path).eval().to('cpu')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = AutoModelForSequenceClassification.from_pretrained(path).eval().to(device)
+    print(f'情感评价：device={device}；共{len(texts)}条', flush=True)
     labels = {int(key): str(value).lower() for key, value in model.config.id2label.items()}
     negative = next(key for key, value in labels.items() if value == 'negative')
     rows = []
     for start in range(0, len(texts), 16):
         batch = texts[start:start + 16]
         lengths = [len(tokenizer(text, add_special_tokens=True)['input_ids']) for text in batch]
-        inputs = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors='pt')
+        inputs = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors='pt').to(device)
         with torch.inference_mode():
             probabilities = model(**inputs).logits.softmax(-1).cpu().numpy()
         rows.extend({'negative_probability': float(prob[negative]), 'negative_prediction': int(prob.argmax() == negative),
                      'sentiment_truncated': int(length > 512)} for prob, length in zip(probabilities, lengths))
+        completed = min(start + 16, len(texts))
+        if completed % 160 == 0 or completed == len(texts):
+            print(f'情感评价：{completed}/{len(texts)}', flush=True)
     return rows
 
 
